@@ -35,6 +35,17 @@ SCHEMA_BOUNDS: Dict[str, Tuple[float, float]] = {
     "st_mass": (0.08, 100.0),
     "st_rad": (0.1, 1000.0),
     "st_lum": (0.0001, 1000000.0),
+    "hz_inner_au": (0.001, 1000.0),
+    "hz_outer_au": (0.001, 1000.0),
+    "hz_lin_pos": (0.0, 1.0),
+    "s_eff_log_pos": (0.0, 1.0),
+    "in_hz": (0.0, 1.0),
+    "st_met": (-2.5, 1.0),
+    "sy_snum": (1.0, 6.0),
+    "s_eff_inner": (0.01, 100.0),
+    "insol_vs_rv": (0.001, 50.0),
+    "flux_ecc_ratio": (1.0, 5.0),
+    "tidal_lock_proxy": (0.0, 1.0),
 }
 
 # Parameters that are direct ML inputs (sampled when present; derived ones recomputed in build_features)
@@ -237,11 +248,14 @@ def run_monte_carlo(
         if (i + 1) % checkpoint_interval == 0 or i == N - 1:
             current_raw = raw_scores[:i + 1]
             current_raw_clipped = np.clip(current_raw, 0.0, 1.0)
-            if earth_raw > 0:
-                current_display = (current_raw_clipped / earth_raw) * 100.0
+            if hasattr(calculator, "raw_to_display_index"):
+                current_display = np.array(
+                    [calculator.raw_to_display_index(float(r)) for r in current_raw_clipped]
+                )
+            elif earth_raw > 1e-6:
+                current_display = np.clip(current_raw_clipped / earth_raw * 100.0, 0.0, 100.0)
             else:
-                current_display = current_raw_clipped * 100.0
-            current_display = np.clip(current_display, 0.0, 100.0)
+                current_display = np.clip(current_raw_clipped * 100.0, 0.0, 100.0)
             current_mean = float(np.mean(current_display))
             running_means.append((i + 1, current_mean))
 
@@ -255,11 +269,14 @@ def run_monte_carlo(
 
     raw_scores = raw_scores[:actual_samples]
     raw_scores = np.clip(raw_scores, 0.0, 1.0)
-    if earth_raw > 0:
-        display_scores = (raw_scores / earth_raw) * 100.0
+    if hasattr(calculator, "raw_to_display_index"):
+        display_scores = np.array(
+            [calculator.raw_to_display_index(float(r)) for r in raw_scores]
+        )
+    elif earth_raw > 1e-6:
+        display_scores = np.clip(raw_scores / earth_raw * 100.0, 0.0, 100.0)
     else:
-        display_scores = raw_scores * 100.0
-    display_scores = np.clip(display_scores, 0.0, 100.0)
+        display_scores = np.clip(raw_scores * 100.0, 0.0, 100.0)
 
     mean_display = float(np.mean(display_scores))
     std_display = float(np.std(display_scores))

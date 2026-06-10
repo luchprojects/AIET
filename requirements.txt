@@ -1,0 +1,21 @@
+# AIET — Artificial Intelligence for Extraterrestrial
+# Python 3.11 or 3.12 recommended (64-bit Windows/macOS/Linux)
+#
+# Install (from project folder):
+#   pip install -r requirements.txt
+#
+# Run the desktop app:
+#   python run_main_window.py
+#
+# Retrain the habitability model (optional; needs NASA CSVs in ml_calibration/data/):
+#   pip install -r requirements-train.txt
+#   python ml_calibration/train_habitability.py
+
+# --- Core (required to run the simulator + habitability index) ---
+pygame>=2.5.0,<3
+numpy>=1.26.0,<3
+xgboost>=2.0.0,<4
+
+# --- Reports & exports (habitability bar chart, physics integrity PDF) ---
+# App runs without this, but export buttons need matplotlib.
+matplotlib>=3.8.0,<4

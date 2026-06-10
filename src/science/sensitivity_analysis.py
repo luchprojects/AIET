@@ -337,11 +337,12 @@ def compute_mc_input_score_correlations(
             feat_vec = build_features(sample, return_meta=False)
             raw_score = calculator._predict_raw(feat_vec)
             raw_score = np.clip(raw_score, 0.0, 1.0)
-            if earth_raw > 0:
-                display_score = (raw_score / earth_raw) * 100.0
+            if hasattr(calculator, "raw_to_display_index"):
+                display_score = calculator.raw_to_display_index(raw_score)
+            elif earth_raw > 1e-6:
+                display_score = float(np.clip(100.0 * raw_score / earth_raw, 0.0, 100.0))
             else:
-                display_score = raw_score * 100.0
-            display_score = np.clip(display_score, 0.0, 100.0)
+                display_score = float(np.clip(raw_score * 100.0, 0.0, 100.0))
             scores.append(display_score)
         except Exception:
             scores.append(np.nan)

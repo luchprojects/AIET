@@ -66,12 +66,24 @@ class MLHabitabilityCalculator:
         self.model.load_model(model_path)
         print(f"[ML] Loaded XGBoost model from: {model_path}")
         
-        # Compute Earth reference for normalization
+        # Earth reference: canonical Solar System vector defines index = 100
         self.earth_features, earth_meta = get_earth_reference_features()
-        self.earth_raw_score = self._predict_raw(self.earth_features)
-        
-        print(f"[ML] Earth raw score: {self.earth_raw_score:.4f}")
+        self.earth_reference_raw = self._predict_raw(self.earth_features)
+        self.earth_raw_score = self.earth_reference_raw  # legacy alias
+
+        print(f"[ML] Earth reference raw: {self.earth_reference_raw:.4f}")
+        print(f"[ML] Display scale: earth_reference_index (Earth = 100)")
         print(f"[ML] Initialization complete")
+
+    def raw_to_display_index(self, raw_score: float) -> float:
+        """
+        Comparative habitability index: Earth reference prediction = 100.
+        Other planets are percentages relative to that baseline (not per-planet forcing).
+        """
+        ref = self.earth_reference_raw
+        if ref > 1e-6:
+            return float(np.clip(100.0 * raw_score / ref, 0.0, 100.0))
+        return float(np.clip(raw_score * 100.0, 0.0, 100.0))
     
     def _predict_raw(self, features: np.ndarray) -> float:
         """
@@ -116,21 +128,15 @@ class MLHabitabilityCalculator:
             # Get raw prediction
             raw_score = self._predict_raw(feature_vector)
             
-            # Normalize to Earth if requested
             if return_raw:
                 final_score = raw_score
             else:
-                # Earth = 100% display mode
-                if self.earth_raw_score > 0:
-                    normalized_score = (raw_score / self.earth_raw_score) * 100.0
-                    final_score = float(np.clip(normalized_score, 0.0, 100.0))
-                else:
-                    final_score = raw_score * 100.0
-            
-            # Add prediction info to meta
+                final_score = self.raw_to_display_index(raw_score)
+
             meta["raw_score"] = raw_score
-            meta["earth_normalized_score"] = final_score if not return_raw else final_score * 100.0
-            meta["normalization_mode"] = "raw" if return_raw else "earth_normalized"
+            meta["earth_reference_raw"] = self.earth_reference_raw
+            meta["display_score"] = final_score if not return_raw else self.raw_to_display_index(raw_score)
+            meta["normalization_mode"] = "earth_reference_index"
             
             if return_meta:
                 return final_score, meta
@@ -167,7 +173,8 @@ class MLHabitabilityCalculator:
                 features_list.append(features)
             except Exception as e:
                 print(f"[ML] Failed to build features for planet: {e}")
-                features_list.append(np.zeros(12, dtype=np.float32))
+                n_feat = len(self.feature_names)
+                features_list.append(np.zeros(n_feat, dtype=np.float32))
         
         X = np.array(features_list, dtype=np.float32)
         
@@ -181,11 +188,10 @@ class MLHabitabilityCalculator:
         if return_raw:
             return raw_scores
         else:
-            if self.earth_raw_score > 0:
-                normalized_scores = (raw_scores / self.earth_raw_score) * 100.0
-                return np.clip(normalized_scores, 0.0, 100.0)
-            else:
-                return raw_scores * 100.0
+            ref = self.earth_reference_raw
+            if ref > 1e-6:
+                return np.clip(raw_scores / ref * 100.0, 0.0, 100.0)
+            return np.clip(raw_scores * 100.0, 0.0, 100.0)
     
     def predict_with_uncertainty(
         self,
@@ -282,8 +288,7 @@ class MLHabitabilityCalculator:
         
         # Predict
         raw_score = self._predict_raw(feature_vector)
-        normalized_score = (raw_score / self.earth_raw_score) * 100.0 if self.earth_raw_score > 0 else raw_score * 100.0
-        normalized_score = float(np.clip(normalized_score, 0.0, 100.0))
+        normalized_score = self.raw_to_display_index(raw_score)
         
         # Get feature importance from booster
         # For XGBoost Booster, use get_score()

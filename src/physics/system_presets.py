@@ -149,10 +149,25 @@ def get_alpha_centauri_system() -> List[Dict[str, Any]]:
     v_rel_AB = (G_AU * M_AB / r_AB) ** 0.5  # relative speed for circular orbit at this separation
     v_A = (M_B / M_AB) * v_rel_AB  # A's speed (tangent, +y when A at +x)
     v_B = (M_A / M_AB) * v_rel_AB  # B's speed (opposite)
-    # Proxima: physically ~13 000 AU; presentation separation (AU) so the triple fits the view.
-    M_total = M_AB + 0.122
-    a_Prox = 36.0
-    v_Prox = (G_AU * M_total / a_Prox) ** 0.5  # tangent speed for circular motion at a_Prox
+
+    # Proxima: physically ~13 000 AU from AB; presentation distance is heavily
+    # compressed so the triple fits on screen. Two stability constraints:
+    #   1. Holman-Wiegert (circumbinary): a_Prox >= ~2.3 * a_AB to escape the
+    #      chaotic zone of a circular binary. a_AB = 23.5 AU -> a_Prox > ~54 AU.
+    #   2. Velocity must be the circular velocity around the *actual* AB
+    #      barycenter (offset from origin because A is heavier than B), not
+    #      around the origin -- otherwise Proxima starts on an eccentric orbit
+    #      that grazes the binary at periapsis and eventually ejects.
+    # We place Proxima at 75 AU (~3.2 * a_AB) to give a comfortable margin and
+    # long-term stability for time-scaled viewing (e.g. 10 yr/sec).
+    M_Prox = 0.122
+    com_AB_x = (M_A * 11.75 + M_B * (-11.75)) / M_AB  # ~+1.111 AU
+    a_Prox = 75.0  # AU from origin; ~3.2 * a_AB, well outside the chaotic zone
+    r_from_AB_com = a_Prox - com_AB_x  # ~73.89 AU; what Proxima actually orbits
+    # Two-body relative speed: sqrt(G * (M_AB + M_Prox) / r). Using the relative
+    # mass keeps the orbit nearly circular once we subtract the system COM velocity
+    # in the N-body init; remaining e <~0.01.
+    v_Prox = (G_AU * (M_AB + M_Prox) / r_from_AB_com) ** 0.5
 
     # Alpha Centauri A
     bodies.append(

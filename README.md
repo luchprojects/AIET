@@ -1,53 +1,30 @@
 # AIET — Artificial Intelligence for Extraterrestrial
 
-AIET is a physics-informed machine learning and visualization platform for exploratory analysis of exoplanet habitability using data from the NASA Exoplanet Archive.
+AIET is a physics-informed machine learning and visualization platform for the exploratory analysis of exoplanet habitability using data from the NASA Exoplanet Archive.
 
 ## Project Purpose
 
-AIET is designed for exploration, comparison, and education rather than definitive life detection.  
-The goal is to provide an interactive way to understand how stellar, orbital, and planetary parameters influence relative habitability outcomes.
+AIET is engineered for exploration, multi-variable comparison, and educational modeling rather than definitive life detection. The system provides an interactive framework to analyze and visualize how complex stellar, orbital, and planetary parameters dynamically influence relative habitability outcomes across thousands of known alien worlds.
 
 ## Key Features
 
-- Physics-informed feature engineering (density, insolation, escape velocity, tidal locking)
-- Machine learning–based relative habitability scoring
-- Interactive visualization for comparative planetary analysis
-- Modular Python pipeline for data processing and experimentation
+- **Physics-Informed Feature Engineering:** Programmatic evaluation of mass-radius bulk densities, stellar insolation fluxes (S_eff), escape velocities (v_esc), and tidal locking synchronization regimes.
+- **Machine Learning Architecture:** Multi-variable relative habitability scoring utilizing an optimized XGBoost classification engine.
+- **Headless Math Verification:** Command-line validation framework to audit orbital integrator energy conservation bounds (ΔE / E_initial ≤ 10⁻⁶) and dimensional consistency across deep data arrays.
+- **Interactive Visualization:** High-performance rendering engine built on Pygame for comparative planetary analysis and parameter space exploration.
 
-## Data Sources
+## Installation & Deployment
 
-- NASA Exoplanet Archive  
-  https://exoplanetarchive.ipac.caltech.edu/
-
-All derived quantities are computed from publicly available archival data.
-
-## Repository Structure
-
-## Installation
+AIET requires **Python 3.11+** (64-bit). Clone the repository and initialize the workspace tracking your target dependencies:
 
 ```bash
-git clone https://github.com/yourusername/AIET.git
+# Clone the repository
+git clone [https://github.com/yourusername/AIET.git](https://github.com/yourusername/AIET.git)
 cd AIET
+
+# Initialize virtual environment
+python -m venv venv
+source venv/bin/activate  # On Windows use: venv\Scripts\activate
+
+# Install core runtime dependencies
 pip install -r requirements.txt
-```
-
-No need for perfection here.
-
----
-## Project Status
-
-This project is under active development.  
-The current version represents an early working prototype focused on pipeline design, interpretability, and visualization.  
-Model refinement, validation, and UI improvements are ongoing.
-
-## Disclaimer
-
-AIET is a research and educational project.  
-Habitability scores are normalized and intended for relative comparison only.
-
-## Planned Work
-
-- Model validation against known planetary regimes
-- Improved UI labeling and visualization clarity
-- Expanded interactive parameter exploration
-- Educational use cases and outreach integration

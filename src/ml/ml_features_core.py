@@ -12,11 +12,9 @@ from typing import Tuple, Dict, Optional
 def load_feature_schema(schema_path: str = None) -> dict:
     """Load the feature schema JSON."""
     if schema_path is None:
-        # Auto-detect schema path (go up from src/ to AIET/)
-        base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        schema_path = os.path.join(base_path, 'ml_calibration', 'features.json')
-    
-    with open(schema_path, 'r') as f:
+        from src.utils.paths import feature_schema_path
+        schema_path = feature_schema_path()
+    with open(schema_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -189,24 +187,88 @@ def build_features(
         meta["imputed_fields"].append("pl_dens (from M,R)")
     pl_dens = float(np.clip(pl_dens, 0.1, 30.0))
     meta["intermediate_values"]["pl_dens"] = pl_dens
+
+    # =============================================================================
+    # KOPPARAPU (2013) HZ — conservative Recent Venus / Early Mars (Table 3)
+    # =============================================================================
+    try:
+        from src.physics.kopparapu_hz import kopparapu_hz_boundaries_au
+    except ImportError:
+        from physics.kopparapu_hz import kopparapu_hz_boundaries_au
+
+    hz_inner_au, hz_outer_au, s_eff_in, s_eff_out = kopparapu_hz_boundaries_au(st_lum, st_teff)
+    hz_width_au = max(hz_outer_au - hz_inner_au, 1e-9)
+    # Linear position in HZ: 0 = Recent Venus edge, 1 = Early Mars edge (Earth ~0.24 at 1 AU)
+    hz_lin_pos = (pl_orbsmax - hz_inner_au) / hz_width_au
+    in_hz = 1.0 if hz_inner_au <= pl_orbsmax <= hz_outer_au else 0.0
+    # Flux-based position in HZ (log insolation between inner/outer S_eff limits)
+    li, lo, lp = np.log(max(s_eff_in, 1e-9)), np.log(max(s_eff_out, 1e-9)), np.log(max(pl_insol, 1e-9))
+    denom = li - lo
+    s_eff_log_pos = float((li - lp) / denom) if abs(denom) > 1e-12 else hz_lin_pos
+    s_eff_log_pos = float(np.clip(s_eff_log_pos, 0.0, 1.0))
+
+    hz_inner_au = float(np.clip(hz_inner_au, 0.001, 1000.0))
+    hz_outer_au = float(np.clip(hz_outer_au, 0.001, 1000.0))
+    hz_lin_pos = float(np.clip(hz_lin_pos, 0.0, 1.0))
+    meta["intermediate_values"]["hz_inner_au"] = hz_inner_au
+    meta["intermediate_values"]["hz_outer_au"] = hz_outer_au
+    meta["intermediate_values"]["hz_s_eff_inner"] = float(s_eff_in)
+    meta["intermediate_values"]["hz_s_eff_outer"] = float(s_eff_out)
+
+    s_eff_inner = float(np.clip(s_eff_in, 0.01, 100.0))
+    s_eff_outer = float(np.clip(s_eff_out, 0.01, 100.0))
+    insol_vs_rv = float(pl_insol / s_eff_inner)
+
+    # NASA archive + sim: stellar metallicity [Fe/H] and system star count
+    st_met = data.get("st_met")
+    if st_met is None or (isinstance(st_met, float) and np.isnan(st_met)):
+        st_met = data.get("metallicity", 0.0)
+    if st_met is None or (isinstance(st_met, float) and np.isnan(st_met)):
+        st_met = 0.0
+        meta["imputed_fields"].append("st_met")
+    st_met = float(np.clip(st_met, -2.5, 1.0))
+
+    sy_snum = data.get("sy_snum")
+    if sy_snum is None or (isinstance(sy_snum, float) and np.isnan(sy_snum)):
+        sy_snum = 1.0
+        meta["imputed_fields"].append("sy_snum")
+    sy_snum = float(np.clip(sy_snum, 1.0, 6.0))
+
+    # Eccentric flux swing (periastron/mean insolation ratio, Keplerian)
+    e = float(np.clip(pl_orbeccen, 0.0, 0.95))
+    flux_ecc_ratio = float(np.sqrt((1.0 + e) / max(1.0 - e, 0.05)))
+
+    # Tidal-locking proxy: short-period planets more likely locked (NASA-consistent heuristic)
+    tidal_lock_proxy = float(np.clip(1.0 / (1.0 + (pl_orbper / 45.0) ** 2), 0.0, 1.0))
     
     # =============================================================================
     # ASSEMBLE FEATURE VECTOR (SCHEMA ORDER)
     # =============================================================================
     
     features = np.array([
-        pl_rade,       # 0
-        pl_masse,      # 1
-        pl_orbper,     # 2
-        pl_orbsmax,    # 3
-        pl_orbeccen,   # 4
-        pl_insol,      # 5
-        pl_eqt,        # 6
-        pl_dens,       # 7
-        st_teff,       # 8
-        st_mass,       # 9
-        st_rad,        # 10
-        st_lum         # 11
+        pl_rade,
+        pl_masse,
+        pl_orbper,
+        pl_orbsmax,
+        pl_orbeccen,
+        pl_insol,
+        pl_eqt,
+        pl_dens,
+        st_teff,
+        st_mass,
+        st_rad,
+        st_lum,
+        hz_inner_au,
+        hz_outer_au,
+        hz_lin_pos,
+        s_eff_log_pos,
+        in_hz,
+        st_met,
+        sy_snum,
+        s_eff_inner,
+        insol_vs_rv,
+        flux_ecc_ratio,
+        tidal_lock_proxy,
     ], dtype=np.float32)
     
     # Validate no NaNs
@@ -232,12 +294,15 @@ def get_earth_reference_features() -> Tuple[np.ndarray, Dict]:
         "pl_orbsmax": 1.0,
         "pl_orbeccen": 0.0167,
         "pl_insol": 1.0,
-        "pl_eqt": 255.0,  # Earth equilibrium temp (no atmosphere)
+        "pl_eqt": 255.0,
         "pl_dens": 5.51,
         "st_teff": 5778.0,
         "st_mass": 1.0,
         "st_rad": 1.0,
-        "st_lum": 1.0
+        "st_lum": 1.0,
+        "st_met": 0.0,
+        "metallicity": 0.0,
+        "sy_snum": 1.0,
     }
     
     return build_features(earth_data, return_meta=True)

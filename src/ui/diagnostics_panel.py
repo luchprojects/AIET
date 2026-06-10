@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import math
 import os
+import json
 import threading
 import time
 from dataclasses import dataclass, field
@@ -69,6 +70,17 @@ class DiagnosticsState:
     
     # Error messages
     last_error: Optional[str] = None
+
+
+@dataclass
+class IntegratorValidationResult:
+    """Minimal integrator diagnostics payload used by the panel UI."""
+    integrator_type: str
+    max_energy_drift: float
+    final_energy_drift: float
+    mean_energy_drift: float
+    max_angular_momentum_drift: float
+    energy_history: List[float] = field(default_factory=list)
 
 
 # Panel configuration
@@ -840,15 +852,25 @@ class ScientificDiagnosticsPanel:
         
         def compute():
             try:
-                from src.physics.integrator_diagnostics import run_integrator_validation
-                
-                result = run_integrator_validation(
-                    bodies=bodies,
-                    duration=1.0,
-                    dt=0.001,
-                    integrator="verlet",
-                    record_interval=50,
-                )
+                result = None
+                try:
+                    from src.physics.integrator_diagnostics import run_integrator_validation
+                    result = run_integrator_validation(
+                        bodies=bodies,
+                        duration=1.0,
+                        dt=0.001,
+                        integrator="verlet",
+                        record_interval=50,
+                    )
+                except Exception:
+                    # Fallback path for builds where integrator_diagnostics module is absent.
+                    result = self._run_integrator_validation_fallback(
+                        bodies=bodies,
+                        duration=1.0,
+                        dt=0.001,
+                        integrator="verlet",
+                        record_interval=50,
+                    )
                 
                 self.state.integrator_data = result
                 self.state.integrator_computed = True
@@ -862,6 +884,103 @@ class ScientificDiagnosticsPanel:
         
         self._integrator_thread = threading.Thread(target=compute, daemon=True)
         self._integrator_thread.start()
+
+    def _run_integrator_validation_fallback(
+        self,
+        bodies: List[Dict[str, Any]],
+        duration: float = 1.0,
+        dt: float = 0.001,
+        integrator: str = "verlet",
+        record_interval: int = 50,
+    ) -> IntegratorValidationResult:
+        """Internal lightweight n-body validator used when diagnostics module is unavailable."""
+        G = 39.478  # AU^3 / (Msun * yr^2)
+
+        def _to3(v: np.ndarray) -> np.ndarray:
+            arr = np.asarray(v, dtype=np.float64).reshape(-1)
+            if arr.size >= 3:
+                return arr[:3].copy()
+            out = np.zeros(3, dtype=np.float64)
+            out[:arr.size] = arr
+            return out
+
+        masses = np.array([max(float(b.get("mass", 0.0)), 1e-15) for b in bodies], dtype=np.float64)
+        pos = np.array([_to3(np.asarray(b["position"], dtype=np.float64)) for b in bodies], dtype=np.float64)
+        vel = np.array([_to3(np.asarray(b["velocity"], dtype=np.float64)) for b in bodies], dtype=np.float64)
+
+        def accelerations(p: np.ndarray) -> np.ndarray:
+            n = len(p)
+            acc = np.zeros_like(p)
+            for i in range(n):
+                for j in range(i + 1, n):
+                    r = p[j] - p[i]
+                    d2 = float(np.dot(r, r)) + 1e-16
+                    inv_d3 = 1.0 / (d2 * np.sqrt(d2))
+                    f = G * r * inv_d3
+                    acc[i] += masses[j] * f
+                    acc[j] -= masses[i] * f
+            return acc
+
+        def total_energy(p: np.ndarray, v: np.ndarray) -> float:
+            kinetic = 0.5 * np.sum(masses[:, None] * (v * v))
+            potential = 0.0
+            n = len(p)
+            for i in range(n):
+                for j in range(i + 1, n):
+                    r = float(np.linalg.norm(p[j] - p[i])) + 1e-16
+                    potential -= G * masses[i] * masses[j] / r
+            return float(kinetic + potential)
+
+        def total_ang_momentum_mag(p: np.ndarray, v: np.ndarray) -> float:
+            L = np.zeros(3, dtype=np.float64)
+            for i in range(len(p)):
+                L += masses[i] * np.cross(p[i], v[i])
+            return float(np.linalg.norm(L))
+
+        steps = max(1, int(duration / dt))
+        interval = max(1, int(record_interval))
+
+        a = accelerations(pos)
+        v_half = vel + 0.5 * dt * a
+
+        e_hist: List[float] = []
+        l_hist: List[float] = []
+
+        e0 = total_energy(pos, vel)
+        l0 = total_ang_momentum_mag(pos, vel)
+        e_hist.append(e0)
+        l_hist.append(l0)
+
+        for step in range(steps):
+            pos = pos + dt * v_half
+            a_new = accelerations(pos)
+            v_half = v_half + dt * a_new
+            vel_curr = v_half - 0.5 * dt * a_new
+
+            if (step + 1) % interval == 0 or step == steps - 1:
+                e_hist.append(total_energy(pos, vel_curr))
+                l_hist.append(total_ang_momentum_mag(pos, vel_curr))
+
+        e_ref = e_hist[0]
+        if abs(e_ref) > 1e-15:
+            e_drifts = [abs((e - e_ref) / e_ref) for e in e_hist]
+        else:
+            e_drifts = [abs(e - e_ref) for e in e_hist]
+
+        l_ref = l_hist[0]
+        if abs(l_ref) > 1e-15:
+            l_drifts = [abs((l - l_ref) / l_ref) for l in l_hist]
+        else:
+            l_drifts = [abs(l - l_ref) for l in l_hist]
+
+        return IntegratorValidationResult(
+            integrator_type=integrator,
+            max_energy_drift=float(max(e_drifts) if e_drifts else 0.0),
+            final_energy_drift=float(e_drifts[-1] if e_drifts else 0.0),
+            mean_energy_drift=float(sum(e_drifts) / len(e_drifts) if e_drifts else 0.0),
+            max_angular_momentum_drift=float(max(l_drifts) if l_drifts else 0.0),
+            energy_history=[float(v) for v in e_hist],
+        )
 
     def _pending_status_text(self, fallback: str) -> str:
         """
@@ -1011,85 +1130,110 @@ class ScientificDiagnosticsPanel:
         self._sensitivity_thread = threading.Thread(target=compute, daemon=True)
         self._sensitivity_thread.start()
     
-    def _export_integrity_report(self):
-        """Export integrity report to JSON."""
+    def _export_integrity_report(self, output_dir: str = "exports") -> Optional[str]:
+        """Export integrity report to JSON. Returns output path on success."""
         try:
-            from src.science.model_integrity import generate_model_integrity_report, export_integrity_report_json
-            
             planet_data = self._get_selected_planet_data()
             if not planet_data:
                 print("[Diagnostics] No planet selected for export")
-                return
-            
-            calculator = getattr(self.viz, "ml_calculator", None)
-            if calculator is None:
-                from src.ml.ml_habitability import MLHabitabilityCalculator
-                calculator = MLHabitabilityCalculator()
-            
-            bodies = self._get_simulation_bodies()
+                return None
+
             planet_name = self.viz.selected_body.get("name", "planet") if self.viz.selected_body else "planet"
-            
-            report = generate_model_integrity_report(
-                calculator=calculator,
-                planet_data=planet_data,
-                bodies=bodies if len(bodies) >= 2 else None,
-                planet_name=planet_name,
-                mc_samples=500,
-                run_integrator=len(bodies) >= 2,
-            )
-            
-            os.makedirs("exports", exist_ok=True)
+            safe_name = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in planet_name) or "planet"
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            output_path = f"exports/integrity_{planet_name}_{timestamp}.json"
-            export_integrity_report_json(report, output_path)
-            
+            os.makedirs(output_dir, exist_ok=True)
+            output_path = os.path.join(output_dir, f"integrity_{safe_name}_{timestamp}.json")
+
+            report = None
+            try:
+                from src.science.model_integrity import generate_model_integrity_report, export_integrity_report_json
+                calculator = getattr(self.viz, "ml_calculator", None)
+                if calculator is None:
+                    from src.ml.ml_habitability import MLHabitabilityCalculator
+                    calculator = MLHabitabilityCalculator()
+                bodies = self._get_simulation_bodies()
+                report = generate_model_integrity_report(
+                    calculator=calculator,
+                    planet_data=planet_data,
+                    bodies=bodies if len(bodies) >= 2 else None,
+                    planet_name=planet_name,
+                    mc_samples=500,
+                    run_integrator=len(bodies) >= 2,
+                )
+                export_integrity_report_json(report, output_path)
+            except Exception:
+                # Fallback report format for builds without src.science.model_integrity.
+                metrics = self.state.integrator_data
+                report = {
+                    "planet_name": planet_name,
+                    "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "planet_data": planet_data,
+                    "integrator": {
+                        "computed": bool(metrics is not None),
+                        "integrator_type": getattr(metrics, "integrator_type", "verlet") if metrics is not None else None,
+                        "max_energy_drift": float(getattr(metrics, "max_energy_drift", 0.0)) if metrics is not None else None,
+                        "final_energy_drift": float(getattr(metrics, "final_energy_drift", 0.0)) if metrics is not None else None,
+                        "mean_energy_drift": float(getattr(metrics, "mean_energy_drift", 0.0)) if metrics is not None else None,
+                        "max_angular_momentum_drift": float(getattr(metrics, "max_angular_momentum_drift", 0.0)) if metrics is not None else None,
+                    },
+                    "uncertainty_available": bool(self.state.uncertainty_computed and self.state.uncertainty_data is not None),
+                    "sensitivity_available": bool(self.state.sensitivity_computed and self.state.sensitivity_data is not None),
+                }
+                with open(output_path, "w", encoding="utf-8") as f:
+                    json.dump(report, f, indent=2)
+            return output_path
         except Exception as e:
             print(f"[Diagnostics] Export failed: {e}")
+            return None
     
-    def _export_sensitivity_report(self):
-        """Export sensitivity report to JSON."""
+    def _export_sensitivity_report(self, output_dir: str = "exports") -> Optional[str]:
+        """Export sensitivity report to JSON. Returns output path on success."""
         if not self.state.sensitivity_computed or self.state.sensitivity_data is None:
             print("[Diagnostics] No sensitivity data to export. Compute first.")
-            return
+            return None
         
         try:
             from src.science.sensitivity_analysis import export_sensitivity_report_json
             
-            os.makedirs("exports", exist_ok=True)
+            os.makedirs(output_dir, exist_ok=True)
             planet_name = getattr(self.state.sensitivity_data, "planet_name", "planet") or "planet"
+            safe_name = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in planet_name) or "planet"
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            output_path = f"exports/sensitivity_{planet_name}_{timestamp}.json"
+            output_path = os.path.join(output_dir, f"sensitivity_{safe_name}_{timestamp}.json")
             
             export_sensitivity_report_json(self.state.sensitivity_data, output_path)
-            
+            return output_path
         except Exception as e:
             print(f"[Diagnostics] Sensitivity export failed: {e}")
+            return None
     
-    def _export_convergence_plot(self):
-        """Export convergence plot to PNG."""
+    def _export_convergence_plot(self, output_dir: str = "exports") -> Optional[str]:
+        """Export convergence plot to PNG. Returns output path on success."""
         if not self.state.uncertainty_computed or self.state.uncertainty_data is None:
             print("[Diagnostics] No uncertainty data to plot. Compute first.")
-            return
+            return None
         
         try:
             from src.ml.ml_uncertainty import export_uncertainty_convergence_plot
             
-            os.makedirs("exports", exist_ok=True)
+            os.makedirs(output_dir, exist_ok=True)
             planet_name = ""
             if self.viz.selected_body:
                 planet_name = self.viz.selected_body.get("name", "planet")
+            safe_name = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in planet_name) or "planet"
             
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            output_path = f"exports/convergence_{planet_name}_{timestamp}.png"
+            output_path = os.path.join(output_dir, f"convergence_{safe_name}_{timestamp}.png")
             
             export_uncertainty_convergence_plot(
                 self.state.uncertainty_data,
                 output_path,
                 planet_name=planet_name,
             )
-            
+            return output_path
         except Exception as e:
             print(f"[Diagnostics] Convergence plot export failed: {e}")
+            return None
     
     def reset_state(self):
         """Reset all computed state (e.g., when planet selection changes)."""

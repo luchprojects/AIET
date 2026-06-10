@@ -88,7 +88,7 @@ def sim_to_ml_features(planet_body: dict, star_body: dict) -> Tuple[Optional[dic
     # =============================================================================
     
     critical_planet_keys = ["radius", "mass"]
-    critical_star_keys = ["temperature", "mass"]
+    critical_star_keys = ["mass"]
     
     # Check critical fields
     for key in critical_planet_keys:
@@ -98,6 +98,12 @@ def sim_to_ml_features(planet_body: dict, star_body: dict) -> Tuple[Optional[dic
     for key in critical_star_keys:
         if key not in star_body or star_body.get(key) is None:
             diagnostics["missing_critical"].append(f"star.{key}")
+
+    star_teff = star_body.get("temperature")
+    if star_teff is None:
+        star_teff = star_body.get("star_temperature")
+    if star_teff is None:
+        diagnostics["missing_critical"].append("star.temperature|star_temperature")
     
     # If critical fields missing, return None
     if diagnostics["missing_critical"]:
@@ -157,14 +163,8 @@ def sim_to_ml_features(planet_body: dict, star_body: dict) -> Tuple[Optional[dic
         diagnostics["missing_optional"].append("pl_orbeccen")
         # Will be filled with 0.0 by feature builder
     
-    # Stellar flux (Earth flux units)
-    pl_insol = planet_body.get("stellarFlux")
-    if pl_insol is not None:
-        features["pl_insol"] = float(pl_insol)
-        diagnostics["mapped_keys"]["pl_insol"] = "planet.stellarFlux"
-    else:
-        diagnostics["missing_optional"].append("pl_insol")
-        # Will be computed from star luminosity + distance
+    # pl_insol: filled after star map as NASA S⊕ = L☉ / a² (not UI stellarFlux geometry)
+    diagnostics["missing_optional"].append("pl_insol (deferred)")
     
     # Equilibrium temperature (NOT surface temperature!)
     # CRITICAL: Use equilibrium_temperature, NOT temperature
@@ -211,9 +211,10 @@ def sim_to_ml_features(planet_body: dict, star_body: dict) -> Tuple[Optional[dic
     # MAP STAR PARAMETERS
     # =============================================================================
     
-    # Stellar temperature (CRITICAL)
-    features["st_teff"] = float(star_body["temperature"])  # Already in Kelvin
-    diagnostics["mapped_keys"]["st_teff"] = "star.temperature"
+    # Stellar effective temperature (CRITICAL)
+    features["st_teff"] = float(star_teff)
+    teff_key = "star.temperature" if star_body.get("temperature") is not None else "star.star_temperature"
+    diagnostics["mapped_keys"]["st_teff"] = teff_key
     
     # Stellar mass (CRITICAL)
     features["st_mass"] = float(star_body["mass"])  # Already in Solar masses
@@ -228,14 +229,56 @@ def sim_to_ml_features(planet_body: dict, star_body: dict) -> Tuple[Optional[dic
         diagnostics["missing_optional"].append("st_rad")
         # Will be estimated by feature builder
     
-    # Stellar luminosity (Solar luminosities)
+    # Stellar metallicity [Fe/H] (NASA stellar_hosts.st_met)
+    st_met = star_body.get("metallicity")
+    if st_met is None:
+        st_met = star_body.get("st_met")
+    if st_met is not None:
+        features["st_met"] = float(st_met)
+        diagnostics["mapped_keys"]["st_met"] = "star.metallicity or star.st_met"
+
+    # Stars in system (NASA sy_snum; 1 = single star)
+    sy_snum = star_body.get("sy_snum")
+    if sy_snum is not None:
+        features["sy_snum"] = float(sy_snum)
+        diagnostics["mapped_keys"]["sy_snum"] = "star.sy_snum"
+
+    # Stellar luminosity (Solar luminosities) — prefer SB from R★, T★ when both known
     st_lum = star_body.get("luminosity")
-    if st_lum is not None:
+    st_rad_for_lum = features.get("st_rad")
+    if st_rad_for_lum is not None and features.get("st_teff") is not None:
+        st_lum_sb = (st_rad_for_lum ** 2) * ((features["st_teff"] / 5778.0) ** 4)
+        if st_lum is None:
+            features["st_lum"] = float(st_lum_sb)
+            diagnostics["mapped_keys"]["st_lum"] = "Stefan-Boltzmann (R★, T★)"
+        else:
+            features["st_lum"] = float(st_lum)
+            diagnostics["mapped_keys"]["st_lum"] = "star.luminosity"
+            if abs(float(st_lum) - st_lum_sb) / max(st_lum_sb, 1e-12) > 0.02:
+                diagnostics["warnings"].append(
+                    f"star.luminosity ({st_lum:.4g}) differs from R★²(T★/5778)⁴ ({st_lum_sb:.4g}); "
+                    "using stored luminosity for ML"
+                )
+    elif st_lum is not None:
         features["st_lum"] = float(st_lum)
         diagnostics["mapped_keys"]["st_lum"] = "star.luminosity"
     else:
         diagnostics["missing_optional"].append("st_lum")
-        # Will be computed from Stefan-Boltzmann law
+
+    # NASA insolation (Earth flux): S⊕ = L☉ / a² — matches training & Kopparapu flux scale
+    pl_orbsmax = features.get("pl_orbsmax")
+    st_lum_val = features.get("st_lum")
+    if pl_orbsmax is not None and st_lum_val is not None and pl_orbsmax > 0:
+        features["pl_insol"] = float(st_lum_val) / (float(pl_orbsmax) ** 2)
+        diagnostics["mapped_keys"]["pl_insol"] = "st_lum/pl_orbsmax^2 (NASA S⊕)"
+        sim_flux = planet_body.get("stellarFlux")
+        if sim_flux is not None:
+            sim_flux = float(sim_flux)
+            if abs(sim_flux - features["pl_insol"]) / max(features["pl_insol"], 1e-9) > 0.05:
+                diagnostics["warnings"].append(
+                    f"UI stellarFlux ({sim_flux:.4g}) differs from ML pl_insol L/a² "
+                    f"({features['pl_insol']:.4g}); ML uses L/a²"
+                )
     
     # =============================================================================
     # VALIDATION
@@ -338,7 +381,7 @@ def predict_with_simulation_body(
     Wrapper to predict habitability from AIET simulation bodies.
     
     Args:
-        ml_calculator: MLHabitabilityCalculatorV4 instance
+        ml_calculator: MLHabitabilityCalculator instance
         planet_body: AIET planet body dict
         star_body: AIET star body dict
         return_diagnostics: If True, return (score, diagnostics) tuple
@@ -408,14 +451,29 @@ def predict_with_simulation_body(
     # =============================================================================
     
     try:
+        # Kopparapu (2013) conservative HZ — same L★, T★ as ML; for UI/diagnostics (not a model input)
+        try:
+            from src.physics.kopparapu_hz import kopparapu_hz_boundaries_au
+        except ImportError:
+            from physics.kopparapu_hz import kopparapu_hz_boundaries_au
+        st_lum_hz = features.get("st_lum")
+        st_teff_hz = features.get("st_teff")
+        if st_lum_hz is not None and st_teff_hz is not None:
+            hz_in, hz_out, s_in, s_out = kopparapu_hz_boundaries_au(
+                float(st_lum_hz), float(st_teff_hz)
+            )
+            diagnostics["hz_inner_au"] = float(hz_in)
+            diagnostics["hz_outer_au"] = float(hz_out)
+            diagnostics["hz_s_eff_inner"] = float(s_in)
+            diagnostics["hz_s_eff_outer"] = float(s_out)
+            diagnostics["hz_model"] = "kopparapu_2013_conservative_rv_em"
+            a_hz = features.get("pl_orbsmax")
+            if a_hz is not None:
+                diagnostics["in_k13_hz"] = bool(hz_in <= float(a_hz) <= hz_out)
+
         # Get ML prediction (raw and Earth-normalized)
         score_raw = ml_calculator.predict(features, return_raw=True)
         score_normalized = ml_calculator.predict(features, return_raw=False)
-        
-        # Special case: If this is Earth preset, force exactly 100.0
-        preset_type = planet_body.get("preset_type", "")
-        if preset_type == "Earth" and 99.0 < score_normalized < 101.0:
-            score_normalized = 100.0
         
         # Store both raw and normalized scores
         diagnostics["score_raw"] = score_raw
@@ -494,7 +552,7 @@ def export_ml_debug_snapshot(
     Export debug snapshot of ML scoring for all planets.
     
     Args:
-        ml_calculator: MLHabitabilityCalculatorV4 instance
+        ml_calculator: MLHabitabilityCalculator instance
         bodies_list: List of (planet_body, star_body, name) tuples
         output_path: Path to save JSON file (default: exports/ml_debug_snapshot.json)
     
@@ -569,7 +627,7 @@ def export_ml_snapshot_single_planet(
     CRITICAL FOR DEMO: Shows exactly what features were fed to model and what score came out.
     
     Args:
-        ml_calculator: MLHabitabilityCalculatorV4 instance
+        ml_calculator: MLHabitabilityCalculator instance
         planet_body: AIET planet body dict
         star_body: AIET star body dict
         output_path: Optional output path (default: exports/ml_snapshot_<timestamp>.json)
@@ -638,7 +696,17 @@ def export_ml_snapshot_single_planet(
             raw_score = ml_calculator._predict_raw(feature_vector)
             
             # Get normalized score
-            normalized_score = (raw_score / ml_calculator.earth_raw_score) * 100.0 if ml_calculator.earth_raw_score > 0 else raw_score * 100.0
+            if hasattr(ml_calculator, "raw_to_display_index"):
+                normalized_score = ml_calculator.raw_to_display_index(raw_score)
+            else:
+                ref = getattr(ml_calculator, "earth_reference_raw", None) or getattr(
+                    ml_calculator, "earth_raw_score", 0
+                )
+                normalized_score = (
+                    float(np.clip(100.0 * raw_score / ref, 0.0, 100.0))
+                    if ref and ref > 1e-6
+                    else float(np.clip(raw_score * 100.0, 0.0, 100.0))
+                )
             normalized_score = float(np.clip(normalized_score, 0.0, 100.0))
             
             snapshot["prediction"]["raw_score"] = float(raw_score)

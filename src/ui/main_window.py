@@ -11,6 +11,7 @@ import os
 import sys
 import csv
 import subprocess
+import textwrap
 from datetime import datetime
 from typing import List, Tuple, Dict, Any, Optional
 from uuid import uuid4
@@ -69,6 +70,11 @@ except ImportError:
 # VERSION (for export provenance)
 # ============================================================================
 AIET_VERSION = "1.0"
+# Orbit layout export (menu label + filename; replaces generic "screenshot")
+ORBIT_SNAPSHOT_MENU_LABEL = "Orbit Snapshot"
+ORBIT_SNAPSHOT_FILENAME = "orbit_snapshot.png"
+ORBIT_SNAPSHOT_AXIS_AU = 40.0
+ORBIT_SNAPSHOT_MARKER_SIZE_SCALE = 2.0  # linear scale (scatter area × scale²)
 
 # ============================================================================
 # DEBUG FLAGS
@@ -195,10 +201,16 @@ TIME_SCALES = [
 ]
 DEFAULT_SCALE_INDEX = 2  # 1.0 sec / sec
 
-# Alpha Centauri preset: single fixed rate (faster rates destabilize N-body / timestep).
+# Alpha Centauri preset: stellar dynamics need years/sec scales to be watchable.
+# AB binary period ~80 yr, Proxima compressed orbit ~448 yr (75 AU from AB COM,
+# placed outside the Holman-Wiegert chaotic zone for long-term stability).
+# N-body sub-stepper caps physics dt at 0.001 yr regardless of rate, so these are stable;
+# inner Proxima planets (P~5-11 days) will visually alias at the higher rates.
 _SECONDS_PER_YEAR_MODULE = 365.25 * 24 * 3600
 TIME_SCALES_ALPHA_CENTAURI = [
-    _SECONDS_PER_YEAR_MODULE,  # 1 simulated year per real second only
+    1.0 * _SECONDS_PER_YEAR_MODULE,   # 1 yr / sec  (AB orbit ~80 s)
+    5.0 * _SECONDS_PER_YEAR_MODULE,   # 5 yr / sec  (AB orbit ~16 s)
+    10.0 * _SECONDS_PER_YEAR_MODULE,  # 10 yr / sec (AB orbit ~8 s)
 ]
 
 # Planet visual scaling constants (NASA-style perceptual compression)
@@ -215,6 +227,17 @@ STAR_MAX_ORBIT_FRACTION_HUGE = 0.70  # Clamp fraction for very large stars (200+
 STAR_HUGE_STAR_THRESHOLD = 200.0  # Solar radii - stars above this can use more orbit space
 STAR_CLAMP_SAFE_RATIO = 0.25  # Star can occupy up to 25% of closest orbit before clamping engages (prevents normal stars from shrinking when inner planets are added)
 STAR_SMALL_STAR_EXEMPTION = 5.0  # Stars <= 5.0 R☉ skip clamping entirely (Sun-like stars never need orbit-based clamping)
+
+# Alpha Centauri triple: stars must read clearly larger than planets at every zoom level.
+# The generic small-star alternate-radius path inflates M/K dwarfs to planet-scale disks;
+# these overrides apply only when _current_preset == "alpha_centauri".
+AC_STAR_RADIUS_FLOOR_GK = 32.0    # Alpha Centauri A & B (G2V / K1V)
+AC_STAR_RADIUS_FLOOR_M = 22.0     # Proxima Centauri (M5.5V; still a star, not a planet dot)
+AC_PLANET_MAX_VS_STAR = 0.25      # planets never exceed 25% of host star visual radius
+AC_PLANET_MAX_PX_ROCKY = 12.0     # rocky / super-Earth absolute cap (px, pre-zoom)
+AC_PLANET_MAX_PX_GIANT = 18.0     # gas-giant absolute cap (px, pre-zoom)
+AC_SCREEN_STAR_MIN_PX = 5         # minimum on-screen star radius when zoomed out
+AC_SCREEN_PLANET_MAX_FRAC = 0.35  # on-screen planet <= 35% of host star on-screen radius
 
 # Physical constants for engulfment detection
 RSUN_TO_AU = 0.00465047  # Solar radius in AU (for physical engulfment check)
@@ -886,9 +909,9 @@ class SolarSystemVisualizer:
         self.export_dropdown_options = [
             "Mission Data Table",
             "Habitability Index Chart",
-            "Orbital State Snapshot",
+            ORBIT_SNAPSHOT_MENU_LABEL,
             "Physics & ML Integrity Report",
-            "Export Full Package",
+            "Export All",
         ]
         self.export_dropdown_item_rects = []
         
@@ -909,6 +932,7 @@ class SolarSystemVisualizer:
         self.export_screenshot_button_rect = pygame.Rect(0, 0, 0, 0)
         self.export_physics_integrity_button_rect = pygame.Rect(0, 0, 0, 0)
         self.export_diag_integrity_button_rect = pygame.Rect(0, 0, 0, 0)
+        self.export_diag_bundle_button_rect = pygame.Rect(0, 0, 0, 0)
         self.export_diag_sensitivity_button_rect = pygame.Rect(0, 0, 0, 0)
         self.export_diag_convergence_button_rect = pygame.Rect(0, 0, 0, 0)
         self.export_system_seed_button_rect = pygame.Rect(0, 0, 0, 0)
@@ -1859,6 +1883,60 @@ class SolarSystemVisualizer:
         cache_dict[name] = (self.camera.zoom, self.camera.offset.copy(), screen_pts)
         return screen_pts
     
+    def _ab_barycenter_screen(self):
+        """Return (cx, cy) in screen coords for the current Alpha Centauri AB barycenter.
+
+        Used by `_draw_nbody_star_rings`. Returns None if the AB pair isn't placed
+        (e.g. on Solar System / TRAPPIST-1 presets) so callers can no-op cleanly.
+        """
+        A = None
+        B = None
+        for b in self.placed_bodies:
+            if b.get("is_destroyed", False) or b.get("type") != "star":
+                continue
+            name = b.get("name")
+            if name == "Alpha Centauri A":
+                A = b
+            elif name == "Alpha Centauri B":
+                B = b
+        if A is None or B is None:
+            return None
+        m_A = float(A.get("mass", 1.0))
+        m_B = float(B.get("mass", 1.0))
+        m_total = m_A + m_B
+        if m_total <= 0:
+            return None
+        com_world = (m_A * np.asarray(A["position"], dtype=float)
+                     + m_B * np.asarray(B["position"], dtype=float)) / m_total
+        return self.world_to_screen(com_world)
+
+    def _draw_nbody_star_rings(self):
+        """Draw a static reference ring for each star in an N-body system.
+
+        For Alpha Centauri the AB binary and Proxima all orbit the AB barycenter,
+        so we render a circle at that barycenter for every star with a stored
+        `nbody_orbit_radius_au`. Matches the visual style of the planets'
+        Kepler orbit grid: a single closed ring, visible from t=0.
+        """
+        center = self._ab_barycenter_screen()
+        if center is None:
+            return
+        cx, cy = int(center[0]), int(center[1])
+        line_w = max(1, int(2 * self.camera.zoom))
+        ring_color = (160, 155, 130)  # warm gray, matches existing star-trail color
+        for body in self.placed_bodies:
+            if body.get("is_destroyed", False) or body.get("type") != "star":
+                continue
+            if not body.get("orbit_enabled", True):
+                continue
+            r_au = body.get("nbody_orbit_radius_au")
+            if r_au is None or r_au <= 0:
+                continue
+            radius_px = int(float(r_au) * AU_TO_PX * self.camera.zoom)
+            if radius_px < 2:
+                continue
+            pygame.draw.circle(self.screen, ring_color, (cx, cy), radius_px, line_w)
+
     def _orbit_grid_points_to_screen(self, body, grid_points):
         """Map parent-relative orbit grid samples to screen coordinates.
 
@@ -2279,7 +2357,7 @@ Moons orbiting beyond this region are dynamically unstable.""",
         "Habitable Zone": """Habitable Zone
 The range of orbital distances where a planet could maintain liquid water under suitable atmospheric conditions.
 
-Boundaries depend primarily on stellar luminosity and temperature.""",
+Boundaries use Kopparapu et al. (2013) conservative limits (Recent Venus inner, Early Mars outer) as functions of stellar luminosity and effective temperature (2600–7200 K).""",
         
         "Metallicity [Fe/H]": """Metallicity [Fe/H]
 A logarithmic measure of a star's heavy-element content relative to the Sun.
@@ -2842,10 +2920,10 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         self.system_seed_export_close_rect = close_rect
 
     def draw_system_seed_import_modal(self):
-        """Draw System Seed import modal (paste seed string)."""
+        """Draw System Seed import modal (browse file or clipboard)."""
         if not getattr(self, "system_seed_import_modal_visible", False):
             return
-        mw, mh = 680, 260
+        mw, mh = 640, 220
         rect = pygame.Rect((self.width - mw) // 2, (self.height - mh) // 2, mw, mh)
         self.system_seed_import_modal_rect = rect
         overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
@@ -2856,32 +2934,36 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
 
         title = self.font.render("System Seed Import", True, self.WHITE)
         self.screen.blit(title, title.get_rect(midtop=(rect.centerx, rect.top + 16)))
-        hint = "Paste a seed and click Import."
+        hint = "Choose a seed .txt file (e.g. system_seed.txt from an export)."
         hint_surf = self.tiny_font.render(hint, True, self.LIGHT_GRAY)
         self.screen.blit(hint_surf, (rect.left + 20, rect.top + 54))
+        hint2 = "Or import directly from your clipboard if you copied a seed."
+        hint2_surf = self.tiny_font.render(hint2, True, self.LIGHT_GRAY)
+        self.screen.blit(hint2_surf, (rect.left + 20, rect.top + 74))
 
-        box = pygame.Rect(rect.left + 20, rect.top + 78, rect.width - 40, 90)
-        pygame.draw.rect(self.screen, (30, 35, 45), box, border_radius=6)
-        pygame.draw.rect(self.screen, (80, 90, 110), box, 1, border_radius=6)
-        text = getattr(self, "system_seed_import_text", "") or ""
-        preview = (text[-140:] if len(text) > 140 else text) + "_"
-        # Draw wrapped preview across 3 lines (last chars are usually most unique)
-        for i in range(3):
-            chunk = preview[i * 52:(i + 1) * 52]
-            if not chunk:
-                break
-            surf = self.tiny_font.render(chunk, True, (235, 235, 235))
-            self.screen.blit(surf, (box.left + 8, box.top + 10 + i * 24))
-
-        bw, bh = 110, 34
-        import_rect = pygame.Rect(rect.centerx - bw - 12, rect.bottom - 52, bw, bh)
-        pygame.draw.rect(self.screen, (90, 185, 120), import_rect, border_radius=5)
-        self.screen.blit(self.subtitle_font.render("Import", True, self.WHITE), self.subtitle_font.render("Import", True, self.WHITE).get_rect(center=import_rect.center))
-        self.system_seed_import_confirm_rect = import_rect
-
-        cancel_rect = pygame.Rect(rect.centerx + 12, rect.bottom - 52, bw, bh)
+        bw, bh = 150, 34
+        gap = 12
+        left_x = rect.centerx - (bw * 2 + gap) // 2
+        browse_rect = pygame.Rect(left_x, rect.bottom - 52, bw, bh)
+        clipboard_rect = pygame.Rect(left_x + bw + gap, rect.bottom - 52, bw, bh)
+        cancel_rect = pygame.Rect(rect.centerx - 55, rect.bottom - 96, 110, 30)
+        pygame.draw.rect(self.screen, (90, 185, 120), browse_rect, border_radius=5)
+        pygame.draw.rect(self.screen, (120, 150, 190), clipboard_rect, border_radius=5)
         pygame.draw.rect(self.screen, (180, 100, 110), cancel_rect, border_radius=5)
-        self.screen.blit(self.subtitle_font.render("Cancel", True, self.WHITE), self.subtitle_font.render("Cancel", True, self.WHITE).get_rect(center=cancel_rect.center))
+        self.screen.blit(
+            self.subtitle_font.render("Browse File", True, self.WHITE),
+            self.subtitle_font.render("Browse File", True, self.WHITE).get_rect(center=browse_rect.center),
+        )
+        self.screen.blit(
+            self.subtitle_font.render("Clipboard", True, self.WHITE),
+            self.subtitle_font.render("Clipboard", True, self.WHITE).get_rect(center=clipboard_rect.center),
+        )
+        self.screen.blit(
+            self.tiny_font.render("Cancel", True, self.WHITE),
+            self.tiny_font.render("Cancel", True, self.WHITE).get_rect(center=cancel_rect.center),
+        )
+        self.system_seed_import_browse_rect = browse_rect
+        self.system_seed_import_clipboard_rect = clipboard_rect
         self.system_seed_import_cancel_rect = cancel_rect
 
     def _default_name_fallback_for_prefab(self, body: Optional[Dict[str, Any]]) -> str:
@@ -3703,7 +3785,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         
         # Create scrollable surface with sufficient initial height
         # We'll render all content first, then use the final y position for scrolling
-        initial_content_height = 2500  # Large enough for all content
+        initial_content_height = 2800  # Large enough for all content
         scroll_surface = pygame.Surface((panel_width - 20, initial_content_height), pygame.SRCALPHA)
         scroll_surface.fill((30, 35, 45, 0))
         
@@ -3761,6 +3843,8 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         
         curr_y = render_text("AIET (Artificial Intelligence for Extraterrestrial)", self.subtitle_font, (200, 220, 255), curr_y)
         curr_y += 5
+        curr_y = render_text(f"Version {AIET_VERSION}", self.tiny_font, (180, 190, 210), curr_y)
+        curr_y += 5
         curr_y = render_text("AIET is a physics-informed, data-driven platform for exploring planetary systems and comparing planetary habitability using established astrophysical models and observational data.", 
                             self.tiny_font, (220, 220, 220), curr_y)
         curr_y += section_spacing
@@ -3797,7 +3881,8 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         curr_y += 5
         
         curr_y = render_bullet("Habitable Zone", curr_y, 0)
-        curr_y = render_bullet("  • Kopparapu-style inner and outer HZ approximations", curr_y, 15)
+        curr_y = render_bullet("  • NASA Archive + Kopparapu (2013) HZ, [Fe/H], multi-star, flux vs RV limit", curr_y, 15)
+        curr_y = render_bullet("  • Index scale: Earth reference = 100 (comparative, not probability of life)", curr_y, 15)
         curr_y += 5
         
         curr_y = render_bullet("System Stability", curr_y, 0)
@@ -3807,8 +3892,8 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         curr_y += 5
         
         curr_y = render_bullet("Gravitational Dynamics", curr_y, 0)
-        curr_y = render_bullet("  • N-body acceleration", curr_y, 15)
-        curr_y = render_bullet("  • Verlet integration", curr_y, 15)
+        curr_y = render_bullet("  • Keplerian rings for preset systems (e.g. Solar System, Alpha Centauri)", curr_y, 15)
+        curr_y = render_bullet("  • N-body acceleration with Verlet integration when N-body mode is active", curr_y, 15)
         curr_y += 5
         
         curr_y = render_bullet("Tidal Locking (ML-Informed Prior)", curr_y, 0)
@@ -3828,8 +3913,22 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         # 4. Machine Learning Layer
         curr_y = render_section_header("Machine Learning Layer", curr_y)
         curr_y += 5
-        curr_y = render_text("AIET includes a physics-informed ML scoring layer trained on 6,000+ confirmed exoplanets from the NASA Exoplanet Archive. The machine-learning layer is designed for comparison and exploration, not for definitive prediction or classification of life. Outputs are constrained by physical models and provide relative, comparative habitability context.", 
-                            self.tiny_font, (220, 220, 220), curr_y)
+        curr_y = render_text(
+            "Habitability scoring uses an XGBoost regressor with 23 NASA Exoplanet Archive and "
+            "Kopparapu (2013) conservative-habitable-zone features. The model was trained on "
+            "~76,000 archive records (default_flag=1) with physics-informed teacher labels, not "
+            "confirmed-life labels. Display index scales so Earth reference = 100.",
+            self.tiny_font, (220, 220, 220), curr_y)
+        curr_y += 10
+        curr_y = render_text(
+            "The ML layer is for comparison and exploration—not definitive prediction or "
+            "classification of life. Outputs are constrained by physical models and provide "
+            "relative, comparative habitability context only.",
+            self.tiny_font, (220, 220, 220), curr_y)
+        curr_y += 5
+        curr_y = render_bullet(
+            "Optional Monte Carlo uncertainty (Ctrl+Shift+U): propagated input uncertainty; not model epistemic error",
+            curr_y, 0)
         curr_y += section_spacing
         
         # 5. Data Sources
@@ -3844,9 +3943,10 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         curr_y += 5
         curr_y = render_bullet("AIET does not detect or confirm life", curr_y, 0)
         curr_y = render_bullet("Outputs reflect relative environmental favorability, not probabilities", curr_y, 0)
+        curr_y = render_bullet("ML scores reflect archive-trained patterns plus physics teacher labels, not ground-truth biology", curr_y, 0)
         curr_y = render_bullet("Atmospheric chemistry and geology are simplified", curr_y, 0)
         curr_y = render_bullet("Biological and evolutionary processes are not modeled", curr_y, 0)
-        curr_y = render_bullet("Results depend on assumptions and data availability", curr_y, 0)
+        curr_y = render_bullet("Results depend on assumptions, imputation, and data availability", curr_y, 0)
         curr_y += 10
         curr_y = render_text("AIET is intended for scientific exploration, education, and hypothesis building—not definitive claims about life beyond Earth.", 
                             self.tiny_font, (200, 200, 200), curr_y, wrap=True)
@@ -3855,8 +3955,11 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         # 7. Project Status
         curr_y = render_section_header("Project Status", curr_y)
         curr_y += 5
-        curr_y = render_text("AIET represents an early but functional step toward integrating physics, machine learning, and visualization to make complex exoplanet data more accessible and explorable. Ongoing work focuses on validation, interpretability, and user-driven scientific exploration.", 
-                            self.tiny_font, (220, 220, 220), curr_y)
+        curr_y = render_text(
+            "AIET is an active research and education build integrating physics, XGBoost habitability "
+            "scoring, interactive visualization, diagnostics exports, and sandbox presets. Ongoing work "
+            "focuses on validation, interpretability, distribution, and user-driven scientific exploration.",
+            self.tiny_font, (220, 220, 220), curr_y)
         
         # Calculate actual content height (add padding at bottom)
         actual_content_height = curr_y + 20
@@ -4057,12 +4160,9 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         buttons = [
             ("Mission Data Table", "table_chart"),
             ("Habitability Index Chart", "chart"),
-            ("Orbital State Snapshot", "screenshot"),
+            (ORBIT_SNAPSHOT_MENU_LABEL, "orbit_snapshot"),
             ("Physics & ML Integrity Report", "physics_integrity"),
-            ("Export Full Package", "all"),
-            ("Diagnostics Integrity", "diag_integrity"),
-            ("Diagnostics Sensitivity", "diag_sensitivity"),
-            ("Diagnostics Uncertainty", "diag_convergence"),
+            ("Export All", "all"),
             ("System Seed (Copy/Research)", "system_seed"),
         ]
         
@@ -4114,12 +4214,14 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 self.export_table_chart_button_rect = btn_rect
             elif export_type == "chart":
                 self.export_chart_button_rect = btn_rect
-            elif export_type == "screenshot":
+            elif export_type in ("screenshot", "orbit_snapshot"):
                 self.export_screenshot_button_rect = btn_rect
             elif export_type == "physics_integrity":
                 self.export_physics_integrity_button_rect = btn_rect
             elif export_type == "diag_integrity":
                 self.export_diag_integrity_button_rect = btn_rect
+            elif export_type == "diag_bundle":
+                self.export_diag_bundle_button_rect = btn_rect
             elif export_type == "diag_sensitivity":
                 self.export_diag_sensitivity_button_rect = btn_rect
             elif export_type == "diag_convergence":
@@ -4128,18 +4230,29 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 self.export_system_seed_button_rect = btn_rect
     
     def _get_ml_version(self) -> str:
-        """Get ML model version."""
-        if self.ml_calculator:
-            if hasattr(self.ml_calculator, 'feature_schema'):
-                return "Model 1"
-            else:
-                return "Legacy"
-        return "none"
+        """Get ML model label for exports."""
+        if not self.ml_calculator:
+            return "none"
+        try:
+            import json
+            from src.utils.paths import model_path
+            summary_path = model_path("training_summary.json")
+            if os.path.isfile(summary_path):
+                with open(summary_path, "r", encoding="utf-8") as f:
+                    s = json.load(f)
+                hz = s.get("hz_model", "K13 HZ")
+                return f"hab_xgb ({hz})"
+        except Exception:
+            pass
+        return "hab_xgb"
     
     def _get_feature_schema_version(self) -> str:
-        """Get feature schema version."""
-        if self.ml_calculator and hasattr(self.ml_calculator, 'feature_schema'):
-            return "Model 1 schema"
+        """Get feature schema label for exports."""
+        if self.ml_calculator and hasattr(self.ml_calculator, "feature_schema"):
+            schema = self.ml_calculator.feature_schema
+            n = len(schema.get("features", []))
+            hz = schema.get("hz_model", "K13")
+            return f"{n} features, {hz}"
         return "unknown"
     
     def _get_parent_star(self, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -4422,8 +4535,8 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
     
     def export_habitability_bar_chart(self, export_dir: str) -> str:
         """Export publication-grade habitability bar chart as high-res PNG.
-        Visual standard: white background, open axes (no full spine box), threshold bar colors,
-        explicit caption and schema footnote. Data: <0.01 as '<0.01', Earth = 100.
+        Visual standard: white background, open axes (no full spine box), threshold bar colors.
+        Data: <0.01 as '<0.01', Earth = 100.
         """
         if not MATPLOTLIB_AVAILABLE:
             print("Warning: matplotlib not available, skipping chart export")
@@ -4433,15 +4546,12 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         
         # Get planets with habitability scores (one star per system — use planet name only; * if modified from preset)
         planets_with_scores = []
-        any_modified = False
         for body in self.placed_bodies:
             if body.get("type") == "planet":
                 habit_score = body.get("habit_score")
                 if habit_score is not None:
                     planet_name = self._planet_display_name(body)
                     planets_with_scores.append((planet_name, habit_score))
-                    if body.get("preset_type") and body.get("modified_from_preset"):
-                        any_modified = True
         
         if not planets_with_scores:
             print("Warning: No planets with habitability scores found")
@@ -4480,10 +4590,10 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         def _habitability_label_color(score: float) -> str:
             return 'white' if score >= _habit_strong_min else 'black'
         
-        # Figure: leave bottom margin for caption + footnote; height scales with number of planets
+        # Figure: extra horizontal margin for whitespace; height scales with planet count
         n_planets = len(labels)
-        fig_height = max(6, n_planets * 0.38)
-        fig, ax = plt.subplots(figsize=(8, fig_height))
+        fig_height = max(5.5, n_planets * 0.38)
+        fig, ax = plt.subplots(figsize=(8.0, fig_height))
         fig.patch.set_facecolor('white')
         ax.set_facecolor('white')
         
@@ -4506,11 +4616,6 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         ax.yaxis.grid(True, linestyle='-', alpha=0.08, color='black')
         ax.set_axisbelow(True)
         
-        # Title and subtitles (hierarchy: title largest, subtitles smaller italic)
-        fig.text(0.5, 0.97, 'Comparative Habitability Index', ha='center', va='top', fontsize=14, fontweight='bold')
-        fig.text(0.5, 0.945, 'Index is comparative, not probabilistic.', ha='center', va='top', fontsize=10, fontstyle='italic', color='black')
-        fig.text(0.5, 0.92, 'Not a biosignature detection metric.', ha='center', va='top', fontsize=10, fontstyle='italic', color='black')
-        
         # Earth reference line (black, subtle)
         ax.axvline(x=100, color='black', linestyle='--', alpha=0.4, linewidth=1.0)
         
@@ -4528,38 +4633,17 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             x_pos = max(score * 0.5, 2) if score >= 0.01 else 1.5
             text_color = 'black' if score < 0.01 else _habitability_label_color(score)
             ax.text(x_pos, i, display_val, va='center', ha='center', fontsize=10, color=text_color, fontweight='bold')
-        
-        # Scientific caption (explicit inputs; aligns with ml_calibration/features.json — no separate greenhouse feature)
-        caption_line1 = (
-            "Comparative habitability index relative to Earth baseline (Earth = 100). "
-            "Dimensionless composite from an XGBoost regressor on twelve inputs: stellar insolation (flux), "
-            "equilibrium temperature, planetary mass, radius, bulk density, orbital period, semi-major axis, "
-            "eccentricity, and stellar effective temperature, mass, radius, and luminosity."
+
+        fig.subplots_adjust(left=0.20, right=0.80, top=0.86, bottom=0.12)
+        ax.set_title(
+            "Comparative Habitability Index",
+            fontsize=14,
+            fontweight="bold",
+            loc="center",
+            pad=16,
         )
-        caption_line2 = (
-            f"Values below the display floor are shown as <0.01. Bar color encodes strength on this comparative scale only "
-            f"(green ≥{_habit_strong_min:g}, yellow {_habit_negligible_max:g}–{_habit_strong_min:g}, gray <{_habit_negligible_max:g}). "
-            f"Not a probability of habitability or life."
-        )
-        footnote = (
-            "Features driving the score (training/inference): pl_rade, pl_masse, pl_orbper, pl_orbsmax, pl_orbeccen, "
-            "pl_insol, pl_eqt, pl_dens, st_teff, st_mass, st_rad, st_lum (see AIET feature schema). "
-            "Greenhouse is not a standalone model input; radiative context enters via insolation and equilibrium temperature."
-        )
-        fig.text(0.5, 0.11, caption_line1, ha='center', va='top', fontsize=8, transform=fig.transFigure)
-        fig.text(0.5, 0.078, caption_line2, ha='center', va='top', fontsize=8, transform=fig.transFigure)
-        fig.text(0.5, 0.038, footnote, ha='center', va='top', fontsize=7, transform=fig.transFigure, color='#222222')
-        
-        # Optional: preset modification note
-        if any_modified:
-            fig.text(0.02, 0.012, '* modified from preset', ha='left', va='bottom', fontsize=7, color='black', transform=fig.transFigure)
-        
-        # Reserve space for title block + captions (no label clipping)
-        plt.tight_layout(rect=(0.02, 0.20, 0.98, 0.88))
-        fig.subplots_adjust(bottom=0.26)
-        
-        # Export: high-resolution PNG (300 DPI) only
-        plt.savefig(export_path_png, dpi=300, bbox_inches='tight', pad_inches=0.15)
+
+        plt.savefig(export_path_png, dpi=300, bbox_inches="tight", pad_inches=0.18)
         plt.close()
         plt.rcParams.update(matplotlib.rcParamsDefault)
         
@@ -4797,29 +4881,115 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         plt.close()
         return export_path
     
-    def _body_position_au(self, body: Dict[str, Any], positions_au: Dict[str, Tuple[float, float]]) -> Tuple[float, float]:
-        """Compute body position in AU for export. Primary star at (0,0); planets/moons from Keplerian elements."""
-        btype = body.get("type")
-        name = body.get("name", "")
-        if btype == "star":
-            # Primary (first) star at origin; others placed by index for multi-star (simplified: all at origin for single-star focus)
-            stars = [b for b in self.placed_bodies if b.get("type") == "star"]
-            if body is stars[0]:
-                return (0.0, 0.0)
-            # Additional stars: no orbital model here; use (0,0) or skip from figure
+    def _orbit_snapshot_star_position_au(self, star: Dict[str, Any]) -> Tuple[float, float]:
+        """Star position in AU before barycentric recentering."""
+        pos_au = star.get("position_au")
+        if pos_au is not None:
+            try:
+                arr = np.asarray(pos_au, dtype=float).reshape(-1)
+                if arr.size >= 2:
+                    return (float(arr[0]), float(arr[1]))
+            except (TypeError, ValueError):
+                pass
+        r_orbit = star.get("nbody_orbit_radius_au")
+        if r_orbit is not None:
+            try:
+                r_au = float(r_orbit)
+                theta = float(star.get("orbit_angle", 0.0))
+                return (r_au * math.cos(theta), r_au * math.sin(theta))
+            except (TypeError, ValueError):
+                pass
+        if star.get("position") is not None and AU_TO_PX > 0:
+            try:
+                pos = np.asarray(star["position"], dtype=float)
+                cx = float(self.width) / 2.0
+                cy = float(self.height) / 2.0
+                return ((pos[0] - cx) / AU_TO_PX, (pos[1] - cy) / AU_TO_PX)
+            except (TypeError, ValueError, IndexError):
+                pass
+        return (0.0, 0.0)
+
+    def _orbit_snapshot_barycenter_au(
+        self, stars: List[Dict[str, Any]], star_positions: Dict[str, Tuple[float, float]]
+    ) -> Tuple[float, float]:
+        """Mass-weighted barycenter of all stars (single star → origin)."""
+        if not stars:
             return (0.0, 0.0)
+        if len(stars) == 1:
+            return star_positions.get(stars[0]["name"], (0.0, 0.0))
+        total_m = 0.0
+        sx, sy = 0.0, 0.0
+        for s in stars:
+            try:
+                m = float(s.get("mass") or 1.0)
+            except (TypeError, ValueError):
+                m = 1.0
+            if m <= 0.0:
+                m = 1.0
+            x, y = star_positions.get(s["name"], (0.0, 0.0))
+            sx += m * x
+            sy += m * y
+            total_m += m
+        if total_m <= 0.0:
+            return (0.0, 0.0)
+        return (sx / total_m, sy / total_m)
+
+    def _orbit_snapshot_shift_positions(
+        self, positions: Dict[str, Tuple[float, float]], origin: Tuple[float, float]
+    ) -> Dict[str, Tuple[float, float]]:
+        ox, oy = origin
+        return {name: (x - ox, y - oy) for name, (x, y) in positions.items()}
+
+    def _orbit_snapshot_centered_axis_limits(
+        self, coords: List[Tuple[float, float]], pad_frac: float = 0.14
+    ) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+        """Square symmetric limits centered on barycenter; tight fit to body layout."""
+        if not coords:
+            lim = 1.0
+            return (-lim, lim), (-lim, lim)
+        max_extent = max(max(abs(x) for x, _y in coords), max(abs(y) for _x, y in coords), 0.35)
+        half = max_extent * (1.0 + pad_frac)
+        return (-half, half), (-half, half)
+
+    def _body_position_au(self, body: Dict[str, Any], positions_au: Dict[str, Tuple[float, float]]) -> Tuple[float, float]:
+        """Compute body position in AU for export (planets/moons Keplerian; stars use AU metadata)."""
+        btype = body.get("type")
+        if btype == "star":
+            return self._orbit_snapshot_star_position_au(body)
         if btype == "planet":
             a = float(body.get("semiMajorAxis", 1.0))
             e = float(body.get("eccentricity", 0.0))
             theta = float(body.get("orbit_angle", 0.0))
             r_au = a * (1 - e**2) / (1 + e * math.cos(theta))
-            return (r_au * math.cos(theta), r_au * math.sin(theta))
+            ox, oy = 0.0, 0.0
+            parent = body.get("parent_obj")
+            if parent is None and body.get("parent"):
+                parent = next(
+                    (
+                        b
+                        for b in self.placed_bodies
+                        if b.get("type") == "star" and b.get("name") == body.get("parent")
+                    ),
+                    None,
+                )
+            if parent is not None and parent.get("name") in positions_au:
+                ox, oy = positions_au[parent["name"]]
+            return (ox + r_au * math.cos(theta), oy + r_au * math.sin(theta))
         if btype == "moon":
             parent = body.get("parent_obj")
+            if not parent:
+                parent = self._get_parent_planet(body)
+            if not parent:
+                pname = body.get("parent")
+                if pname:
+                    parent = next(
+                        (b for b in self.placed_bodies if b.get("type") == "planet" and b.get("name") == pname),
+                        None,
+                    )
             if not parent or parent.get("name") not in positions_au:
                 return (0.0, 0.0)
             px, py = positions_au[parent["name"]]
-            a = float(body.get("semiMajorAxis", 0.00257))
+            a = float(body.get("semiMajorAxis") or body.get("semi_major_axis") or 0.00257)
             e = float(body.get("eccentricity", 0.0))
             theta = float(body.get("orbit_angle", 0.0))
             r_au = a * (1 - e**2) / (1 + e * math.cos(theta))
@@ -4828,7 +4998,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
 
     def _orbit_path_au(self, body: Dict[str, Any], parent_pos_au: Tuple[float, float], n_pts: int = 200) -> List[Tuple[float, float]]:
         """Ellipse path in AU for a planet or moon. parent_pos_au is (0,0) for planets, (px,py) for moons."""
-        a = float(body.get("semiMajorAxis", 1.0))
+        a = float(body.get("semiMajorAxis") or body.get("semi_major_axis") or 1.0)
         e = float(body.get("eccentricity", 0.0))
         px, py = parent_pos_au
         path = []
@@ -4856,16 +5026,472 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         s = min_sep_au / dist
         return (px + dx * s, py + dy * s)
 
+    def _orbit_snapshot_sandbox_bg_hex(self) -> str:
+        """Sandbox simulation background (DARK_BLUE)."""
+        r, g, b = self.DARK_BLUE
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _orbit_snapshot_scaled_marker_area(self, area: float) -> float:
+        """Double linear marker size while preserving star/planet/moon ratios."""
+        s = ORBIT_SNAPSHOT_MARKER_SIZE_SCALE
+        return area * (s * s)
+
+    def _orbit_snapshot_marker_radius_au(self, area_base: float) -> float:
+        """Approximate scatter marker radius in AU on the snapshot axes."""
+        area = self._orbit_snapshot_scaled_marker_area(area_base)
+        radius_pt = math.sqrt(max(area, 1.0) / math.pi)
+        axis_span_au = 2.0 * ORBIT_SNAPSHOT_AXIS_AU
+        fig_px = 8.0 * 300.0 * 0.85  # fig height, dpi, axes fraction after tight_layout
+        au_per_px = axis_span_au / fig_px
+        radius_px = (radius_pt / 72.0) * 300.0
+        return radius_px * au_per_px
+
+    def _orbit_snapshot_body_color(self, body: Dict[str, Any]) -> str:
+        """Match sandbox fill color (base_color hex, same fallbacks as render)."""
+        base_color_hex = body.get("base_color")
+        if base_color_hex:
+            return str(base_color_hex)
+        btype = body.get("type")
+        name = body.get("name", "")
+        if btype == "star":
+            star_rgb = body.get("star_color")
+            if star_rgb and len(star_rgb) >= 3:
+                try:
+                    r, g, b = int(star_rgb[0]), int(star_rgb[1]), int(star_rgb[2])
+                    return f"#{r:02x}{g:02x}{b:02x}"
+                except (TypeError, ValueError, IndexError):
+                    pass
+            return CELESTIAL_BODY_COLORS.get(name, CELESTIAL_BODY_COLORS.get("Sun", "#FDB813"))
+        if btype == "moon":
+            return CELESTIAL_BODY_COLORS.get(name, CELESTIAL_BODY_COLORS.get("Moon", "#B0B0B0"))
+        return CELESTIAL_BODY_COLORS.get(name, CELESTIAL_BODY_COLORS.get("Earth", "#2E7FFF"))
+
+    def _orbit_snapshot_star_dot_size(self, body: Dict[str, Any]) -> float:
+        """Largest marker on the snapshot — always bigger than any planet."""
+        try:
+            r_sun = float(body.get("radius") or 109.0)
+        except (TypeError, ValueError):
+            r_sun = 109.0
+        return max(380.0, 28.0 * (max(r_sun, 50.0) ** 0.35))
+
+    def _orbit_snapshot_planet_dot_size(self, body: Dict[str, Any]) -> float:
+        """Scatter area (points^2); scales with radius in Earth radii (Jupiter >> Earth)."""
+        r = body.get("radius")
+        try:
+            r_e = float(r) if r is not None else 1.0
+        except (TypeError, ValueError):
+            r_e = 1.0
+        r_e = max(0.3, min(14.0, r_e))
+        return min(165.0, 22.0 * (r_e ** 0.82))
+
+    def _orbit_snapshot_moon_dot_size(self, body: Dict[str, Any]) -> float:
+        """Moon markers — smaller than planets."""
+        return 12.0
+
+    def _orbit_snapshot_is_gas_giant(self, body: Dict[str, Any]) -> bool:
+        try:
+            r_e = float(body.get("radius") or 1.0)
+            m_e = float(body.get("mass") or 0.0)
+        except (TypeError, ValueError):
+            return False
+        return r_e >= 5.0 or m_e >= 12.0
+
+    def _orbit_snapshot_outermost_planet_au(
+        self, planets: List[Dict[str, Any]], planet_positions: Dict[str, Tuple[float, float]]
+    ) -> float:
+        """Semi-major axis (AU) of the outermost planet — sets axis limit and orbit rings."""
+        sma_max = 0.0
+        pos_max = 0.0
+        for p in planets:
+            try:
+                sma_max = max(sma_max, float(p.get("semiMajorAxis") or p.get("semi_major_axis") or 0.0))
+            except (TypeError, ValueError):
+                pass
+            nm = p.get("name")
+            if nm in planet_positions:
+                x, y = planet_positions[nm]
+                pos_max = max(pos_max, math.hypot(x, y))
+        return max(sma_max, pos_max, 0.5)
+
+    def _orbit_snapshot_au_axis_ticks(self, max_au: float) -> List[float]:
+        """Tick values from -max_au to +max_au; endpoints are ±outermost orbit (AU)."""
+        max_au = float(max_au)
+        if max_au <= 2.0:
+            step = 0.5
+        elif max_au <= 8.0:
+            step = 1.0
+        elif max_au <= 24.0:
+            step = 5.0
+        else:
+            step = 10.0
+        ticks: List[float] = [0.0]
+        v = step
+        while v < max_au - 1e-9:
+            ticks.extend([-v, v])
+            v += step
+        ticks.extend([-max_au, max_au])
+        return sorted(set(round(t, 4) for t in ticks))
+
+    def _orbit_snapshot_planet_sma_au(self, body: Dict[str, Any], planet_pos_true: Dict[str, Tuple[float, float]]) -> float:
+        nm = body.get("name", "")
+        try:
+            a_au = float(body.get("semiMajorAxis") or body.get("semi_major_axis") or 0.0)
+        except (TypeError, ValueError):
+            a_au = 0.0
+        if a_au <= 0.0 and nm in planet_pos_true:
+            a_au = math.hypot(*planet_pos_true[nm])
+        return max(a_au, 0.0)
+
+    def _orbit_snapshot_planet_layout(
+        self,
+        planets: List[Dict[str, Any]],
+        planet_pos_true: Dict[str, Tuple[float, float]],
+        outermost_true_au: float,
+    ) -> Tuple[Dict[str, Tuple[float, float]], Dict[str, float]]:
+        """Display layout on ±40 AU chart: inner belt expanded; outer keeps order; dots on rings."""
+        inner_split_au = 4.0
+        axis_au = ORBIT_SNAPSHOT_AXIS_AU
+        inner_r_min = 5.0
+        inner_r_max = 14.0
+        outer_r_start = 17.0
+        outer_r_end = axis_au * 0.93
+        body_by_name = {b["name"]: b for b in planets}
+        entries: List[Tuple[str, float, float]] = []
+        for body in planets:
+            nm = body["name"]
+            a_au = self._orbit_snapshot_planet_sma_au(body, planet_pos_true)
+            x, y = planet_pos_true.get(nm, (0.0, 0.0))
+            theta = math.atan2(y, x)
+            entries.append((nm, a_au, theta))
+        entries.sort(key=lambda t: t[1])
+
+        inner = [e for e in entries if e[1] <= inner_split_au]
+        outer = [e for e in entries if e[1] > inner_split_au]
+        giants = [e for e in outer if self._orbit_snapshot_is_gas_giant(body_by_name[e[0]])]
+        other_outer = [e for e in outer if e not in giants]
+
+        plot_pos: Dict[str, Tuple[float, float]] = {}
+        ring_r: Dict[str, float] = {}
+        n_inner = len(inner)
+        for i, (nm, _a_au, theta) in enumerate(inner):
+            if n_inner > 1:
+                r_disp = inner_r_min + (i / (n_inner - 1)) * (inner_r_max - inner_r_min)
+                theta_plot = (2.0 * math.pi * i / n_inner) - (math.pi / 2.0)
+            else:
+                r_disp = inner_r_min
+                theta_plot = theta
+            ring_r[nm] = r_disp
+            plot_pos[nm] = (r_disp * math.cos(theta_plot), r_disp * math.sin(theta_plot))
+
+        def _outer_display_radius(a_au: float) -> float:
+            denom = max(outermost_true_au - inner_split_au, 0.5)
+            frac = max(0.0, min(1.0, (a_au - inner_split_au) / denom))
+            return outer_r_start + frac * (outer_r_end - outer_r_start)
+
+        n_giants = len(giants)
+        for i, (nm, a_au, theta) in enumerate(giants):
+            r_disp = _outer_display_radius(a_au)
+            ring_r[nm] = r_disp
+            if n_giants > 1:
+                theta_plot = (2.0 * math.pi * i / n_giants) + (math.pi / 4.0)
+            else:
+                theta_plot = theta
+            plot_pos[nm] = (r_disp * math.cos(theta_plot), r_disp * math.sin(theta_plot))
+
+        for nm, a_au, theta in other_outer:
+            r_disp = _outer_display_radius(a_au)
+            ring_r[nm] = r_disp
+            plot_pos[nm] = (r_disp * math.cos(theta), r_disp * math.sin(theta))
+
+        return plot_pos, ring_r
+
+    def _spread_planets_on_orbit_rings(
+        self,
+        plot_pos: Dict[str, Tuple[float, float]],
+        ring_r_by_name: Dict[str, float],
+        axis_au: float,
+    ) -> Dict[str, Tuple[float, float]]:
+        """Tangential spacing only — each planet stays on its display ring."""
+        polar: Dict[str, Tuple[float, float]] = {}
+        for nm, (x, y) in plot_pos.items():
+            a_au = ring_r_by_name.get(nm, math.hypot(x, y))
+            if a_au < 1e-12:
+                polar[nm] = (0.0, math.atan2(y, x))
+            else:
+                polar[nm] = (a_au, math.atan2(y, x))
+
+        names = list(polar.keys())
+        if len(names) < 2:
+            return {
+                nm: (a * math.cos(th), a * math.sin(th))
+                for nm, (a, th) in polar.items()
+            }
+
+        min_sep = max(0.55, axis_au * 0.018)
+        for _ in range(40):
+            moved = False
+            xy = {
+                nm: (polar[nm][0] * math.cos(polar[nm][1]), polar[nm][0] * math.sin(polar[nm][1]))
+                for nm in names
+            }
+            for i in range(len(names)):
+                for j in range(i + 1, len(names)):
+                    ni, nj = names[i], names[j]
+                    xi, yi = xy[ni]
+                    xj, yj = xy[nj]
+                    dx, dy = xj - xi, yj - yi
+                    dist = math.hypot(dx, dy)
+                    if dist >= min_sep:
+                        continue
+                    push = min(0.35, (min_sep - dist) * 0.35 / max(polar[ni][0], polar[nj][0], 0.2))
+                    polar[ni] = (polar[ni][0], polar[ni][1] - push)
+                    polar[nj] = (polar[nj][0], polar[nj][1] + push)
+                    moved = True
+            if not moved:
+                break
+
+        return {
+            nm: (a * math.cos(th), a * math.sin(th))
+            for nm, (a, th) in polar.items()
+        }
+
+    def _orbit_snapshot_moon_clearance_au(
+        self,
+        parent_body: Dict[str, Any],
+        planet_plot_pos: Dict[str, Tuple[float, float]],
+    ) -> float:
+        """Minimum parent–moon center separation so marker circles do not overlap."""
+        pname = parent_body["name"]
+        px, py = planet_plot_pos.get(pname, (0.0, 0.0))
+        parent_r = math.hypot(px, py)
+        parent_marker_r = self._orbit_snapshot_marker_radius_au(
+            self._orbit_snapshot_planet_dot_size(parent_body)
+        )
+        moon_marker_r = self._orbit_snapshot_marker_radius_au(self._orbit_snapshot_moon_dot_size(parent_body))
+        edge_gap_au = 0.18
+        return max(
+            parent_marker_r + moon_marker_r + edge_gap_au,
+            1.35,
+            ORBIT_SNAPSHOT_AXIS_AU * 0.035,
+            parent_r * 0.12,
+        )
+
+    def _orbit_snapshot_moon_plot_positions(
+        self,
+        moons: List[Dict[str, Any]],
+        planet_plot_pos: Dict[str, Tuple[float, float]],
+        positions_au: Dict[str, Tuple[float, float]],
+    ) -> Dict[str, Tuple[float, float]]:
+        """Moons on parent-centered display rings, pushed out so dots clear the parent."""
+        by_parent: Dict[str, List[Dict[str, Any]]] = {}
+        for b in moons:
+            parent = b.get("parent_obj") or self._get_parent_planet(b)
+            pname = parent.get("name") if parent else ""
+            if pname and pname in planet_plot_pos:
+                by_parent.setdefault(pname, []).append(b)
+
+        out: Dict[str, Tuple[float, float]] = {}
+        for pname, moon_list in by_parent.items():
+            px, py = planet_plot_pos[pname]
+            ptx, pty = positions_au.get(pname, (px, py))
+            parent_body = moon_list[0].get("parent_obj") or self._get_parent_planet(moon_list[0])
+            if not parent_body:
+                continue
+            clearance = self._orbit_snapshot_moon_clearance_au(parent_body, planet_plot_pos)
+            parent_theta = math.atan2(py, px)
+            n_m = len(moon_list)
+            for i, b in enumerate(moon_list):
+                nm = b["name"]
+                try:
+                    a_m = float(b.get("semiMajorAxis") or b.get("semi_major_axis") or 0.00257)
+                except (TypeError, ValueError):
+                    a_m = 0.00257
+                r_disp = max(a_m, clearance)
+                mx, my = positions_au.get(nm, (px, py))
+                theta_true = math.atan2(my - pty, mx - ptx)
+                if n_m > 1:
+                    theta = parent_theta + (2.0 * math.pi * i / n_m)
+                else:
+                    theta = theta_true
+                    if r_disp <= clearance + 1e-9:
+                        theta = parent_theta + (math.pi / 5.0)
+                out[nm] = (px + r_disp * math.cos(theta), py + r_disp * math.sin(theta))
+        for b in moons:
+            nm = b["name"]
+            if nm not in out:
+                out[nm] = positions_au.get(nm, (0.0, 0.0))
+        return out
+
+    def _orbit_snapshot_r_max_au(self, positions_au: Dict[str, Tuple[float, float]]) -> float:
+        """Largest orbital distance (AU) used for display radial scaling."""
+        radii = [math.hypot(x, y) for x, y in positions_au.values()]
+        if not radii:
+            return 1.0
+        return max(1.0, max(radii))
+
+    def _orbit_snapshot_display_radius(self, r_au: float, r_max_au: float) -> float:
+        """Monotonic display radius: expands inner belt, preserves outer order with gap at 4 AU."""
+        if r_au <= 0.0:
+            return 0.0
+        r_max_au = max(r_max_au, 0.5)
+        inner_split = 4.0
+        inner_scale = 3.0
+        inner_display_edge = 10.5  # matches inner_max_disp slot belt
+        outer_gap = 4.5  # gap between inner belt and first outer planet
+        if r_au <= inner_split:
+            return max(0.45, r_au * inner_scale)
+        if r_max_au <= inner_split + 1e-6:
+            return r_au * inner_scale
+        outer_start = inner_display_edge + outer_gap
+        outer_frac = (r_au - inner_split) / (r_max_au - inner_split)
+        outer_true_span = r_max_au - inner_split
+        outer_display_span = max(outer_true_span * 1.05, 9.0)
+        return outer_start + outer_frac * outer_display_span
+
+    def _orbit_snapshot_expand_layout(
+        self, positions: Dict[str, Tuple[float, float]], factor: float
+    ) -> Dict[str, Tuple[float, float]]:
+        """Push all bodies slightly outward from barycenter after spacing (rings stay aligned)."""
+        if factor <= 1.0:
+            return dict(positions)
+        return {name: (x * factor, y * factor) for name, (x, y) in positions.items()}
+
+    def _orbit_snapshot_map_xy(
+        self, x: float, y: float, r_max_au: float
+    ) -> Tuple[float, float]:
+        """Map true AU (x,y) to display AU; preserves angle and orbital order."""
+        r = math.hypot(x, y)
+        if r < 1e-12:
+            return (0.0, 0.0)
+        theta = math.atan2(y, x)
+        r_disp = self._orbit_snapshot_display_radius(r, r_max_au)
+        return (r_disp * math.cos(theta), r_disp * math.sin(theta))
+
+    def _orbit_snapshot_planet_positions_display(
+        self, planet_pos_true: Dict[str, Tuple[float, float]], r_max_au: float
+    ) -> Dict[str, Tuple[float, float]]:
+        """Inner belt: evenly spaced display radii + fanned angles. Outer: proportional map."""
+        inner_split_au = 4.0
+        inner_min_disp = 3.6
+        inner_max_disp = 10.5
+        entries: List[Tuple[str, float, float]] = []
+        for name, (x, y) in planet_pos_true.items():
+            entries.append((name, math.hypot(x, y), math.atan2(y, x)))
+        entries.sort(key=lambda t: t[1])
+        inner = [e for e in entries if e[1] <= inner_split_au]
+        outer = [e for e in entries if e[1] > inner_split_au]
+        display: Dict[str, Tuple[float, float]] = {}
+        n_inner = len(inner)
+        for i, (name, r_true, theta) in enumerate(inner):
+            if n_inner > 1:
+                r_disp = inner_min_disp + (i / (n_inner - 1)) * (inner_max_disp - inner_min_disp)
+                theta_disp = (2.0 * math.pi * i / n_inner) - (math.pi / 2.0)
+            else:
+                r_disp = self._orbit_snapshot_display_radius(r_true, r_max_au)
+                theta_disp = theta
+            display[name] = (r_disp * math.cos(theta_disp), r_disp * math.sin(theta_disp))
+        for name, r_true, theta in outer:
+            r_disp = self._orbit_snapshot_display_radius(r_true, r_max_au)
+            display[name] = (r_disp * math.cos(theta), r_disp * math.sin(theta))
+        return display
+
+    def _orbit_snapshot_moon_display_xy(
+        self,
+        moon: Dict[str, Any],
+        positions_au: Dict[str, Tuple[float, float]],
+        positions_display: Dict[str, Tuple[float, float]],
+    ) -> Tuple[float, float]:
+        parent = moon.get("parent_obj") or self._get_parent_planet(moon)
+        if not parent or parent.get("name") not in positions_display:
+            return positions_au.get(moon["name"], (0.0, 0.0))
+        px, py = positions_display[parent["name"]]
+        mx, my = positions_au.get(moon["name"], (px, py))
+        ptx, pty = positions_au.get(parent["name"], (px, py))
+        dx, dy = mx - ptx, my - pty
+        dist = math.hypot(dx, dy)
+        if dist < 1e-12:
+            return (px + 0.28, py)
+        ring = 0.32
+        return (px + (dx / dist) * ring, py + (dy / dist) * ring)
+
+    def _orbit_snapshot_map_path(
+        self, path: List[Tuple[float, float]], r_max_au: float
+    ) -> List[Tuple[float, float]]:
+        return [
+            (
+                self._orbit_snapshot_display_radius(math.hypot(x, y), r_max_au)
+                * math.cos(math.atan2(y, x)),
+                self._orbit_snapshot_display_radius(math.hypot(x, y), r_max_au)
+                * math.sin(math.atan2(y, x)),
+            )
+            for x, y in path
+        ]
+
+    def _spread_planets_for_orbit_snapshot(
+        self, display_pos: Dict[str, Tuple[float, float]], display_span: float
+    ) -> Dict[str, Tuple[float, float]]:
+        """Tangential nudge only — keeps each planet on its heliocentric ring."""
+        adjusted = dict(display_pos)
+        min_sep = float(min(1.2, max(0.35, 0.045 * display_span)))
+        if display_span < 18.0:
+            min_sep = max(min_sep, 0.55)
+        elif display_span > 40.0:
+            min_sep = max(min_sep, 0.9)
+        names = list(adjusted.keys())
+        if len(names) < 2:
+            return adjusted
+
+        def _tangential_push(x: float, y: float, sign: float, amount: float) -> Tuple[float, float]:
+            r = math.hypot(x, y)
+            if r < 1e-9:
+                return (x + sign * amount, y)
+            tx, ty = -y / r, x / r
+            return (x + sign * amount * tx, y + sign * amount * ty)
+
+        for _ in range(32):
+            moved = False
+            for i in range(len(names)):
+                for j in range(i + 1, len(names)):
+                    ni, nj = names[i], names[j]
+                    xi, yi = adjusted[ni]
+                    xj, yj = adjusted[nj]
+                    dx, dy = xj - xi, yj - yi
+                    dist = math.hypot(dx, dy)
+                    if dist >= min_sep:
+                        continue
+                    push = (min_sep - dist) * 0.5
+                    adjusted[ni] = _tangential_push(xi, yi, -1.0, push)
+                    adjusted[nj] = _tangential_push(xj, yj, 1.0, push)
+                    moved = True
+            if not moved:
+                break
+        return adjusted
+
     def export_simulation_figure(self, export_dir: str) -> str:
-        """Export publication-grade simulation figure: axes in AU, labeled ticks, legend (stars/planets/moons),
-        simulation-time title, caption (integration, dt, units). Saves screenshot.png (300 DPI) only."""
+        """Export orbit layout figure (AU axes, symbol legend, body labels). Saves orbit_snapshot.png (300 DPI)."""
         if not MATPLOTLIB_AVAILABLE:
-            return self._export_screenshot_pygame(export_dir)
-        export_path_png = os.path.join(export_dir, "screenshot.png")
+            return self._export_orbit_snapshot_pygame(export_dir)
+        os.makedirs(export_dir, exist_ok=True)
+        export_path_png = os.path.join(export_dir, ORBIT_SNAPSHOT_FILENAME)
         if not self.placed_bodies:
             print("Warning: No bodies to export in simulation figure; using pygame fallback")
-            return self._export_screenshot_pygame(export_dir)
-        from matplotlib.lines import Line2D
+            return self._export_orbit_snapshot_pygame(export_dir)
+        try:
+            return self._build_orbit_snapshot_figure(export_dir, export_path_png)
+        except Exception as e:
+            plt.close("all")
+            try:
+                plt.rcParams.update(matplotlib.rcParamsDefault)
+            except Exception:
+                pass
+            print(f"Orbit snapshot figure failed: {e}")
+            traceback.print_exc()
+            raise
+
+    def _build_orbit_snapshot_figure(self, export_dir: str, export_path_png: str) -> str:
+        for _mb in self.placed_bodies:
+            if _mb.get("type") == "moon":
+                self._ensure_moon_orbits_host_planet(_mb)
 
         # Build positions in AU (order: stars, planets, moons)
         positions_au: Dict[str, Tuple[float, float]] = {}
@@ -4879,270 +5505,176 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         for b in moons:
             positions_au[b["name"]] = self._body_position_au(b, positions_au)
 
-        # Orbit paths in AU
-        all_x, all_y = [], []
-        orbit_paths: List[Tuple[str, List[Tuple[float, float]]]] = []
-        for body in planets + moons:
-            parent = body.get("parent_obj")
-            if body["type"] == "planet":
-                parent_pos = (0.0, 0.0)
-            elif parent and parent.get("name") in positions_au:
-                parent_pos = positions_au[parent["name"]]
-            else:
-                continue
-            path = self._orbit_path_au(body, parent_pos)
-            orbit_paths.append((body["name"], path))
-            for (x, y) in path:
-                all_x.append(x)
-                all_y.append(y)
-        for _name, (x, y) in positions_au.items():
-            all_x.append(x)
-            all_y.append(y)
-        if not all_x or not all_y:
-            return self._export_screenshot_pygame(export_dir)
+        star_pos = {b["name"]: positions_au[b["name"]] for b in stars}
+        bary_au = self._orbit_snapshot_barycenter_au(stars, star_pos)
+        positions_au = self._orbit_snapshot_shift_positions(positions_au, bary_au)
 
-        pad = 0.15
-        raw_x_min, raw_x_max = min(all_x), max(all_x)
-        raw_y_min, raw_y_max = min(all_y), max(all_y)
-        span_x = max(raw_x_max - raw_x_min, 0.1)
-        span_y = max(raw_y_max - raw_y_min, 0.1)
-        x_min = raw_x_min - pad * span_x
-        x_max = raw_x_max + pad * span_x
-        y_min = raw_y_min - pad * span_y
-        y_max = raw_y_max + pad * span_y
-        frame_width_au = x_max - x_min
-        frame_height_au = y_max - y_min
-        max_span = max(span_x, span_y)
+        planet_pos_true = {b["name"]: positions_au[b["name"]] for b in planets}
+        if not planet_pos_true:
+            return self._export_orbit_snapshot_pygame(export_dir)
 
-        # Minimum parent–moon separation in AU (publication clarity; scales slightly with system size)
-        moon_sep_au = float(min(0.12, max(0.04, 0.02 * max_span)))
-        moon_plot_pos: Dict[str, Tuple[float, float]] = {}
-        for b in moons:
-            nm = b["name"]
-            mx, my = positions_au[nm]
-            parent = b.get("parent_obj")
-            if parent and parent.get("name") in positions_au:
-                px, py = positions_au[parent["name"]]
-                mx, my = self._nudge_moon_plot_pos((px, py), (mx, my), moon_sep_au)
-            moon_plot_pos[nm] = (mx, my)
+        outermost_au = self._orbit_snapshot_outermost_planet_au(planets, planet_pos_true)
+        plot_limit_au = ORBIT_SNAPSHOT_AXIS_AU
+        planet_plot_pos, ring_r_by_name = self._orbit_snapshot_planet_layout(
+            planets, planet_pos_true, outermost_au
+        )
+        planet_plot_pos = self._spread_planets_on_orbit_rings(
+            planet_plot_pos, ring_r_by_name, ORBIT_SNAPSHOT_AXIS_AU
+        )
+        moon_plot_pos = self._orbit_snapshot_moon_plot_positions(
+            moons, planet_plot_pos, positions_au
+        )
 
-        def _planet_marker_area(body: Dict[str, Any]) -> Tuple[float, str]:
-            """Return scatter area (points^2) and category for legend."""
-            m = body.get("mass")
-            r = body.get("radius")
-            try:
-                r_e = float(r) if r is not None else 1.0
-            except (TypeError, ValueError):
-                r_e = 1.0
-            try:
-                m_e = float(m) if m is not None else None
-            except (TypeError, ValueError):
-                m_e = None
-            # Gas / ice giants vs terrestrials (Earth units)
-            is_giant = (m_e is not None and m_e >= 12.0) or (r_e >= 5.0)
-            if is_giant:
-                return (95.0 + min(310.0, 30.0 * (r_e ** 0.6)), "giant")
-            return (48.0 + min(125.0, 36.0 * (r_e ** 0.5)), "terrestrial")
+        sandbox_bg = self._orbit_snapshot_sandbox_bg_hex()
+        orbit_line = "#c8c8c8"
+        label_color = "#ebf0fa"
+        caption_color = "#aab4c8"
 
-        def _legend_ms_from_area(area: float) -> float:
-            """Map scatter s (area) to Line2D markersize (approximate match)."""
-            return max(4.0, min(14.0, math.sqrt(area / 12.0)))
+        def _draw_orbits_and_grid(
+            target_ax,
+            moon_positions: Dict[str, Tuple[float, float]],
+            grid_alpha: float = 0.22,
+        ) -> None:
+            from matplotlib.patches import Circle as MplCircle
 
-        def _spread_planet_plot_pos(raw_pos: Dict[str, Tuple[float, float]], min_sep: float) -> Dict[str, Tuple[float, float]]:
-            """Display-only spread so close inner planets don't visually stack."""
-            adjusted = dict(raw_pos)
-            names = list(adjusted.keys())
-            if len(names) < 2:
-                return adjusted
-            for _ in range(12):
-                moved = False
-                for i in range(len(names)):
-                    for j in range(i + 1, len(names)):
-                        ni, nj = names[i], names[j]
-                        xi, yi = adjusted[ni]
-                        xj, yj = adjusted[nj]
-                        dx = xj - xi
-                        dy = yj - yi
-                        dist = math.hypot(dx, dy)
-                        if dist >= min_sep:
-                            continue
-                        if dist < 1e-9:
-                            dx, dy = 1.0, 0.0
-                            dist = 1.0
-                        push = (min_sep - dist) / 2.0
-                        ux, uy = dx / dist, dy / dist
-                        adjusted[ni] = (xi - ux * push, yi - uy * push)
-                        adjusted[nj] = (xj + ux * push, yj + uy * push)
-                        moved = True
-                if not moved:
-                    break
-            return adjusted
-
-        def _draw_orbits_and_grid(target_ax, grid_alpha: float = 0.15) -> None:
-            for _name, path in orbit_paths:
-                xs = [p[0] for p in path]
-                ys = [p[1] for p in path]
-                target_ax.plot(xs, ys, color="black", linewidth=1.0, zorder=1)
-            target_ax.grid(True, linestyle="-", alpha=grid_alpha, color="black")
+            for body in planets:
+                nm = body["name"]
+                r_ring = ring_r_by_name.get(nm, 0.0)
+                if r_ring <= 0.0:
+                    continue
+                target_ax.add_patch(
+                    MplCircle(
+                        (0.0, 0.0), r_ring, fill=False, edgecolor=orbit_line, linewidth=1.0, zorder=1
+                    )
+                )
+            for b in moons:
+                nm = b["name"]
+                if nm not in moon_positions:
+                    continue
+                parent = b.get("parent_obj") or self._get_parent_planet(b)
+                if not parent or parent.get("name") not in planet_plot_pos:
+                    continue
+                px, py = planet_plot_pos[parent["name"]]
+                mx, my = moon_positions[nm]
+                ring_r = math.hypot(mx - px, my - py)
+                if ring_r < 1e-5:
+                    continue
+                target_ax.add_patch(
+                    MplCircle(
+                        (px, py), ring_r, fill=False, edgecolor=orbit_line, linewidth=0.9, zorder=1
+                    )
+                )
+            target_ax.grid(True, linestyle="-", alpha=grid_alpha, color=orbit_line)
             target_ax.set_axisbelow(True)
 
-        # Matplotlib: scientific style
         plt.rcParams.update({
-            "figure.facecolor": "white",
-            "axes.facecolor": "white",
-            "axes.edgecolor": "black",
-            "axes.linewidth": 1.0,
-            "xtick.color": "black",
-            "ytick.color": "black",
+            "figure.facecolor": sandbox_bg,
+            "axes.facecolor": sandbox_bg,
+            "axes.edgecolor": sandbox_bg,
+            "axes.linewidth": 0.0,
+            "xtick.color": sandbox_bg,
+            "ytick.color": sandbox_bg,
             "font.family": ["Helvetica", "Arial", "sans-serif"],
         })
         fig, ax = plt.subplots(figsize=(8.5, 8))
-        fig.patch.set_facecolor("white")
-        ax.set_facecolor("white")
+        fig.patch.set_facecolor(sandbox_bg)
+        ax.set_facecolor(sandbox_bg)
         ax.set_aspect("equal")
-        _draw_orbits_and_grid(ax, grid_alpha=0.15)
 
-        ax.set_xlabel("X (AU)", fontsize=11)
-        ax.set_ylabel("Y (AU)", fontsize=11)
-        ax.tick_params(axis="both", which="major", labelsize=10)
-        ax.set_xlim(x_min, x_max)
-        ax.set_ylim(y_min, y_max)
+        x_lim = (-plot_limit_au, plot_limit_au)
+        y_lim = (-plot_limit_au, plot_limit_au)
 
-        marker_star = "*"
-        marker_planet = "o"
-        legend_handles = []
+        _draw_orbits_and_grid(ax, moon_plot_pos, grid_alpha=0.12)
 
-        for body in stars:
-            x, y = positions_au[body["name"]]
-            ax.scatter([x], [y], marker=marker_star, s=280, c="black", edgecolors="none", zorder=5)
-            legend_handles.append(
-                Line2D(
-                    [0],
-                    [0],
-                    marker=marker_star,
-                    color="w",
-                    markerfacecolor="black",
-                    markersize=13,
-                    linestyle="None",
-                    label=body.get("display_name") or body["name"],
-                )
-            )
+        ax.set_xlim(x_lim)
+        ax.set_ylim(y_lim)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+        ax.tick_params(axis="both", which="both", left=False, bottom=False, labelleft=False, labelbottom=False)
 
-        planet_plot_pos = _spread_planet_plot_pos(
-            {b["name"]: positions_au[b["name"]] for b in planets},
-            min_sep=float(min(0.28, max(0.06, 0.028 * max_span))),
-        )
-
+        marker_dot = "o"
         for body in planets:
-            x, y = planet_plot_pos.get(body["name"], positions_au[body["name"]])
-            area, cat = _planet_marker_area(body)
-            dot_area = area * (0.24 if cat == "giant" else 0.28)
-            # Planet style: black dot centered in open black circle ("dot on O")
+            x, y = planet_plot_pos[body["name"]]
             ax.scatter(
-                [x],
-                [y],
-                marker=marker_planet,
-                s=area,
-                facecolors="white",
-                edgecolors="black",
-                linewidths=1.35 if cat == "giant" else 1.15,
-                zorder=6,
+                [x], [y], marker=marker_dot,
+                s=self._orbit_snapshot_scaled_marker_area(self._orbit_snapshot_planet_dot_size(body)),
+                c=self._orbit_snapshot_body_color(body), edgecolors="none", zorder=6,
             )
-            ax.scatter(
-                [x],
-                [y],
-                marker=marker_planet,
-                s=dot_area,
-                c="black",
-                edgecolors="black",
-                linewidths=0.5,
-                zorder=7,
-            )
-            legend_handles.append(
-                Line2D(
-                    [0],
-                    [0],
-                    marker=marker_planet,
-                    color="w",
-                    markerfacecolor="white",
-                    markeredgecolor="black",
-                    markeredgewidth=1.1,
-                    markersize=_legend_ms_from_area(area),
-                    linestyle="None",
-                    label=body.get("display_name") or body["name"],
-                )
-            )
+            pname = body.get("display_name") or body["name"]
+            ax.annotate(pname, (x, y), xytext=(5, 5), textcoords="offset points", fontsize=7, color=label_color, zorder=9)
 
         for body in moons:
             nm = body["name"]
-            x, y = moon_plot_pos.get(nm, positions_au[nm])
-            # Moon crescent: dark disc + offset white disc mask
-            ax.scatter([x], [y], marker="o", s=66, c="black", edgecolors="black", linewidths=0.8, zorder=7)
-            crescent_dx = float(0.010 * max_span + 0.004)
-            ax.scatter([x + crescent_dx], [y], marker="o", s=56, c="white", edgecolors="white", linewidths=0.0, zorder=8)
-            legend_handles.append(
-                Line2D(
-                    [0],
-                    [0],
-                    marker="o",
-                    color="w",
-                    markerfacecolor="black",
-                    markeredgecolor="black",
-                    markeredgewidth=0.8,
-                    markersize=6,
-                    linestyle="None",
-                    label=body.get("display_name") or body["name"],
-                )
+            if nm not in moon_plot_pos:
+                continue
+            x, y = moon_plot_pos[nm]
+            ax.scatter(
+                [x], [y], marker=marker_dot,
+                s=self._orbit_snapshot_scaled_marker_area(self._orbit_snapshot_moon_dot_size(body)),
+                c=self._orbit_snapshot_body_color(body), edgecolors="none", zorder=7,
+            )
+            mname = body.get("display_name") or nm
+            parent = body.get("parent_obj") or self._get_parent_planet(body)
+            if parent and parent.get("name") in planet_plot_pos:
+                ppx, ppy = planet_plot_pos[parent["name"]]
+                dx, dy = x - ppx, y - ppy
+                if math.hypot(dx, dy) > 1e-9:
+                    label_off = (6 * dx / math.hypot(dx, dy), 6 * dy / math.hypot(dx, dy))
+                else:
+                    label_off = (5, -8)
+            else:
+                label_off = (5, -8)
+            ax.annotate(
+                mname, (x, y), xytext=label_off, textcoords="offset points",
+                fontsize=7, color=label_color, zorder=9,
             )
 
-        ax.legend(
-            handles=legend_handles,
-            loc="upper left",
-            bbox_to_anchor=(1.02, 1),
-            fontsize=9,
-            frameon=True,
-            framealpha=1,
-            edgecolor="black",
-        )
+        for body in stars:
+            x, y = positions_au[body["name"]]
+            ax.scatter(
+                [x], [y], marker=marker_dot,
+                s=self._orbit_snapshot_scaled_marker_area(self._orbit_snapshot_star_dot_size(body)),
+                c=self._orbit_snapshot_body_color(body), edgecolors="none", zorder=8,
+            )
+            sname = body.get("display_name") or body["name"]
+            ax.annotate(
+                sname,
+                (x, y),
+                xytext=(0, 22),
+                textcoords="offset points",
+                fontsize=7,
+                color=label_color,
+                ha="center",
+                va="bottom",
+                zorder=9,
+            )
 
-        sim_days = self.simulation_time_seconds / 86400.0
-        if self.simulation_time_seconds < 1.0:
-            ax.set_title("Initial Simulation Start Time", fontsize=12, pad=10)
-        elif sim_days < 1.0:
-            ax.set_title(f"Simulation Time: {sim_days * 24.0:.2f} hours", fontsize=12, pad=10)
-        else:
-            ax.set_title(f"Simulation Time: {sim_days:.1f} days", fontsize=12, pad=10)
-
-        caption = (
-            "Integration: Keplerian (orbital elements; no N-body). "
-            f"Time step: dt = {self.base_time_step} (base) × time scale (variable). "
-            "Units: positions in AU, time in days. "
-            "Gravitational parameter not applicable under Keplerian approximation; positions derived from orbital elements. "
-            f"View auto-scaled to ≈ {frame_width_au:.2f} AU (width) × {frame_height_au:.2f} AU (height)."
-        )
         fig.text(
             0.5,
-            0.02,
-            caption,
+            0.015,
+            "Schematic layout (not to scale)",
             ha="center",
             va="bottom",
             fontsize=8,
+            color=caption_color,
             transform=fig.transFigure,
-            bbox={"boxstyle": "round,pad=0.4", "facecolor": "white", "edgecolor": "#bbbbbb", "linewidth": 0.8},
         )
-        plt.tight_layout(rect=(0, 0.08, 1, 0.94))
-        fig.subplots_adjust(right=0.78, bottom=0.14)
-        plt.savefig(export_path_png, dpi=300, bbox_inches="tight", pad_inches=0.2)
+        plt.tight_layout(rect=(0, 0.03, 1, 1))
+        plt.savefig(export_path_png, dpi=300, bbox_inches="tight", pad_inches=0.12, facecolor=sandbox_bg)
         plt.close()
         try:
             plt.rcParams.update(matplotlib.rcParamsDefault)
         except Exception:
             pass
+        if not os.path.isfile(export_path_png):
+            raise OSError(f"Orbit snapshot file was not written: {export_path_png}")
         return export_path_png
 
-    def _export_screenshot_pygame(self, export_dir: str) -> str:
+    def _export_orbit_snapshot_pygame(self, export_dir: str) -> str:
         """Fallback: export pygame sandbox as PNG when matplotlib is not available."""
-        export_path = os.path.join(export_dir, "screenshot.png")
+        export_path = os.path.join(export_dir, ORBIT_SNAPSHOT_FILENAME)
         top_bar_height = self.tab_height + 2 * self.tab_margin
         time_panel_height = 100
         time_panel_margin = 20
@@ -5162,10 +5694,35 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         pygame.image.save(export_surface, export_path)
         return export_path
 
-    def export_screenshot(self, export_dir: str) -> str:
-        """Export simulation as publication-grade figure (axes in AU, legend, caption) or fallback to pygame screenshot.
-        Produces screenshot.png (300+ DPI when matplotlib available) only."""
-        return self.export_simulation_figure(export_dir)
+    def export_orbit_snapshot(self, export_dir: str) -> Optional[str]:
+        """Export orbit layout figure (AU axes). Immediate when matplotlib is available."""
+        if not self.placed_bodies:
+            print("Warning: No bodies placed — orbit snapshot skipped")
+            return None
+        os.makedirs(export_dir, exist_ok=True)
+        if MATPLOTLIB_AVAILABLE:
+            try:
+                path = self.export_simulation_figure(export_dir)
+                if path and os.path.isfile(path):
+                    return path
+                print("Warning: orbit snapshot export returned no file")
+            except Exception as e:
+                print(f"Orbit snapshot export failed: {e}")
+                traceback.print_exc()
+                try:
+                    fallback = self._export_orbit_snapshot_pygame(export_dir)
+                    if fallback and os.path.isfile(fallback):
+                        print(f"Orbit snapshot pygame fallback: {fallback}")
+                        return fallback
+                except Exception as fb_err:
+                    print(f"Orbit snapshot pygame fallback failed: {fb_err}")
+            return None
+        self.pending_screenshot_export_dir = export_dir
+        return None
+
+    def export_screenshot(self, export_dir: str) -> Optional[str]:
+        """Legacy alias for orbit snapshot export."""
+        return self.export_orbit_snapshot(export_dir)
     
     def export_physics_integrity_report(self, export_dir: str) -> Optional[str]:
         """
@@ -5213,12 +5770,51 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         # Integrator diagnostics
         add_line("1. Integrator Diagnostics (ΔE/E₀)", fontsize=13, weight="bold")
         try:
-            from src.science.model_integrity import get_latest_integrator_metrics  # type: ignore
+            # Prefer diagnostics panel state (current implementation path), then fallback
+            # to legacy model_integrity import if present in older builds.
+            metrics = None
+            panel = getattr(self, "diagnostics_panel", None)
+            if panel is not None:
+                state = getattr(panel, "state", None)
+                if state is not None:
+                    metrics = getattr(state, "integrator_data", None)
 
-            metrics = get_latest_integrator_metrics()
-            add_line(f"Max |ΔE/E₀|:   {metrics.max_energy_drift:.3e}")
-            add_line(f"Final |ΔE/E₀|: {metrics.final_energy_drift:.3e}")
-            add_line(f"Mean |ΔE/E₀|:  {metrics.mean_energy_drift:.3e}")
+            if metrics is None:
+                try:
+                    from src.science.model_integrity import get_latest_integrator_metrics  # type: ignore
+                    metrics = get_latest_integrator_metrics()
+                except Exception:
+                    metrics = None
+
+            if metrics is None:
+                add_line("Integrator metrics unavailable. Run 'Run Integrator Validation' in Diagnostics first.", fontsize=10)
+            else:
+                max_drift = getattr(metrics, "max_energy_drift", None)
+                final_drift = getattr(metrics, "final_energy_drift", None)
+                mean_drift = getattr(metrics, "mean_energy_drift", None)
+
+                # Compute missing summary values from raw energy history when needed.
+                if max_drift is None or final_drift is None or mean_drift is None:
+                    energy_history = getattr(metrics, "energy_history", None)
+                    if energy_history and len(energy_history) > 1:
+                        e0 = float(energy_history[0])
+                        if abs(e0) > 1e-15:
+                            drifts = [abs((float(e) - e0) / e0) for e in energy_history]
+                        else:
+                            drifts = [abs(float(e) - e0) for e in energy_history]
+                        if max_drift is None:
+                            max_drift = max(drifts)
+                        if final_drift is None:
+                            final_drift = drifts[-1]
+                        if mean_drift is None:
+                            mean_drift = float(sum(drifts) / len(drifts))
+
+                if max_drift is None or final_drift is None or mean_drift is None:
+                    add_line("Integrator metrics available but incomplete for summary export.", fontsize=10)
+                else:
+                    add_line(f"Max |ΔE/E₀|:   {float(max_drift):.3e}")
+                    add_line(f"Final |ΔE/E₀|: {float(final_drift):.3e}")
+                    add_line(f"Mean |ΔE/E₀|:  {float(mean_drift):.3e}")
         except Exception:
             add_line("Integrator energy drift metrics not available in this session.", fontsize=10)
 
@@ -5277,9 +5873,49 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         export_dir = os.path.join("exports", f"AIET_Export_{timestamp}")
         os.makedirs(export_dir, exist_ok=True)
         return export_dir
+
+    def export_diagnostics_bundle(self, export_dir: str) -> List[str]:
+        """Export all available diagnostics artifacts to a single directory."""
+        exported: List[str] = []
+        panel = getattr(self, "diagnostics_panel", None)
+        if panel is None:
+            print("Diagnostics export skipped: diagnostics panel unavailable")
+            return exported
+
+        try:
+            integrity_path = panel._export_integrity_report(export_dir)
+            if integrity_path:
+                exported.append(integrity_path)
+                print(f"Exported: {integrity_path}")
+            else:
+                print("Diagnostics integrity export skipped (select a planet/moon first).")
+        except Exception as e:
+            print(f"Diagnostics integrity export failed: {e}")
+
+        try:
+            sensitivity_path = panel._export_sensitivity_report(export_dir)
+            if sensitivity_path:
+                exported.append(sensitivity_path)
+                print(f"Exported: {sensitivity_path}")
+            else:
+                print("Diagnostics sensitivity export skipped (compute sensitivity first).")
+        except Exception as e:
+            print(f"Diagnostics sensitivity export failed: {e}")
+
+        try:
+            convergence_path = panel._export_convergence_plot(export_dir)
+            if convergence_path:
+                exported.append(convergence_path)
+                print(f"Exported: {convergence_path}")
+            else:
+                print("Diagnostics convergence export skipped (compute uncertainty first).")
+        except Exception as e:
+            print(f"Diagnostics convergence export failed: {e}")
+
+        return exported
     
     def export_all(self) -> str:
-        """Export all artifacts (Table CSV+PNG, Bar Chart, Screenshot)."""
+        """Export all artifacts (Table CSV+PNG, Bar Chart, Orbit Snapshot)."""
         export_dir = self.create_export_directory()
         exported_files = []
         
@@ -5310,10 +5946,35 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         except Exception as e:
             print(f"Error exporting chart: {e}")
             traceback.print_exc()
+
+        # Diagnostics bundle
+        try:
+            diag_files = self.export_diagnostics_bundle(export_dir)
+            exported_files.extend(diag_files)
+            if not diag_files:
+                print("Diagnostics bundle export skipped (no diagnostics data ready).")
+        except Exception as e:
+            print(f"Error exporting diagnostics bundle: {e}")
+            traceback.print_exc()
         
-        # Screenshot is deferred to next frame (via pending_screenshot_export_dir) so export UI is not in the shot
-        
+        # Orbit snapshot (matplotlib uses placed_bodies — no screen capture needed)
+        try:
+            snap_path = self.export_orbit_snapshot(export_dir)
+            if snap_path:
+                exported_files.append(snap_path)
+                print(f"Exported: {snap_path}")
+            elif getattr(self, "pending_screenshot_export_dir", None) == export_dir:
+                print("Orbit snapshot will finish on next frame (pygame fallback).")
+            else:
+                print("Orbit snapshot skipped (no bodies or matplotlib unavailable).")
+        except Exception as e:
+            print(f"Error exporting orbit snapshot: {e}")
+            traceback.print_exc()
+
         print(f"\nExport complete! {len(exported_files)} file(s) saved to: {export_dir}")
+        snap = os.path.join(export_dir, ORBIT_SNAPSHOT_FILENAME)
+        if os.path.isfile(snap):
+            print(f"  Orbit map: {snap}")
         return export_dir
 
     def calculate_hitbox_radius(self, obj_type: str, visual_radius: float) -> float:
@@ -5370,7 +6031,9 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         # For stars smaller than the Sun, also compute a planet-style perceptual radius
         # in Earth radii and use the larger of the two so the star remains visually
         # dominant (star > planet) without changing Sun-like star sizing.
-        if stellar_radius_solar < 1.0:
+        # Skip this alternate path for Alpha Centauri: it inflates Proxima (0.154 R☉)
+        # and B (0.86 R☉) to planet-scale disks and breaks star-vs-planet readability.
+        if stellar_radius_solar < 1.0 and getattr(self, "_current_preset", None) != "alpha_centauri":
             try:
                 star_radius_r_earth = float(stellar_radius_solar) * float(SUN_RADIUS_R_EARTH)
                 visual_radius_alt = EARTH_RADIUS_PX * math.pow(max(0.0, star_radius_r_earth), 0.4)
@@ -5414,12 +6077,14 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 star_body["_is_near_engulfment"] = is_near_engulfment
                 star_body["_closest_planet_au"] = closest_planet_au
         
-        # Alpha Centauri: three stars at very different true radii + crowded view; boost disks
-        # slightly and enforce a floor so M dwarfs still read as stars (not planet-like dots).
-        # Solar System and other presets are unchanged.
+        # Alpha Centauri: tiered floors so G/K primaries read larger than the M dwarf,
+        # and all stars stay clearly bigger than any planet (see AC_PLANET_MAX_VS_STAR).
         if getattr(self, "_current_preset", None) == "alpha_centauri":
-            visual_radius = float(visual_radius) * 1.18
-            visual_radius = max(visual_radius, 15.0)
+            name = star_body.get("name", "")
+            if name == "Proxima Centauri":
+                visual_radius = max(float(visual_radius), AC_STAR_RADIUS_FLOOR_M)
+            else:
+                visual_radius = max(float(visual_radius), AC_STAR_RADIUS_FLOOR_GK)
 
         return visual_radius
 
@@ -5442,8 +6107,22 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         # With a global power-law distance compression, orbit rings can become visually
         # stacked. Apply a preset-specific *visual-only* spread multiplier so rings
         # remain separated without changing the bodies' stored AU values/physics.
-        if getattr(self, "_current_preset", None) == "trappist_1":
+        preset = getattr(self, "_current_preset", None)
+        if preset == "trappist_1":
             a *= 3.0
+        elif preset == "alpha_centauri":
+            # Proxima's inner subsystem (d at 0.029 AU, b at 0.048 AU) is sub-pixel
+            # at the AC system-wide zoom level (~0.038), so the rings vanish. Pin
+            # the two inner planets to visually distinct virtual radii so all three
+            # Proxima orbits read as separate rings; Proxima c (1.48 AU) and
+            # Alpha Centauri Ab (1.50 AU) already render comfortably and are
+            # left alone. Stored semi-major-axis values (and all physics that
+            # consumes them) are unchanged -- this is rendering only, the same
+            # trade-off TRAPPIST-1 already makes above.
+            if a < 0.04:        # Proxima d
+                a = 0.45
+            elif a < 0.10:      # Proxima b
+                a = 1.00
 
         return float(AU_TO_PX * math.pow(a, PLANET_DISTANCE_SCALE_POWER))
 
@@ -5569,10 +6248,108 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             
         # Clamp: min=MIN_PLANET_PX, max=fraction of host star disk (tighter in α Cen so planets
         # stay clearly smaller than stars in the triple layout). Other presets unchanged.
-        max_vs_star = 0.52 if getattr(self, "_current_preset", None) == "alpha_centauri" else 0.85
-        visual_radius = max(MIN_PLANET_PX, min(visual_radius, star_visual_radius * max_vs_star))
+        preset = getattr(self, "_current_preset", None)
+        if preset == "alpha_centauri":
+            max_vs_star = AC_PLANET_MAX_VS_STAR
+            visual_radius = max(MIN_PLANET_PX, min(visual_radius, star_visual_radius * max_vs_star))
+            # Absolute caps so gas giants (e.g. Ab at 9 R⊕) do not look star-sized.
+            is_giant = (
+                float(planet_body.get("radius", 1.0)) >= 4.0
+                or "giant" in str(planet_body.get("classification", "")).lower()
+            )
+            abs_cap = AC_PLANET_MAX_PX_GIANT if is_giant else AC_PLANET_MAX_PX_ROCKY
+            visual_radius = min(visual_radius, abs_cap)
+        else:
+            visual_radius = max(MIN_PLANET_PX, min(visual_radius, star_visual_radius * 0.85))
         
         return visual_radius
+
+    def _sync_planet_position_au(self, planet: dict, parent_star: dict, scale_px: float) -> None:
+        """Write barycentric position_au from current pixel offset relative to host star."""
+        if (
+            planet.get("position") is None
+            or parent_star.get("position") is None
+            or parent_star.get("position_au") is None
+            or scale_px <= 0
+        ):
+            return
+        rel_au = (np.asarray(planet["position"], dtype=float) - np.asarray(parent_star["position"], dtype=float)) / float(scale_px)
+        planet["position_au"] = np.asarray(parent_star["position_au"], dtype=float)[:2] + rel_au[:2]
+
+    def _update_ac_planets_keplerian(self, planets: list, effective_dt: float, scale_px: float) -> None:
+        """
+        Alpha Centauri: stars use N-body; planets stay on the drawn Kepler rings.
+
+        Orbit grids are built from get_visual_orbit_radius(semiMajorAxis) around each
+        host. Full N-body integration drifts planets off those rings because of
+        multi-star tides and AU/pixel mismatch. Instead we advance orbit_angle and
+        call compute_planet_position each frame so planets track their moving host.
+        """
+        for body in planets:
+            if body.get("is_destroyed", False):
+                continue
+            parent = body.get("parent_obj")
+            if parent is None and body.get("parent"):
+                parent = next(
+                    (b for b in self.placed_bodies if b.get("name") == body["parent"] and b.get("type") == "star"),
+                    None,
+                )
+                if parent is not None:
+                    body["parent_obj"] = parent
+            if parent is None or parent.get("type") != "star":
+                continue
+
+            orbit_speed = body.get("orbit_speed", 0.0)
+            orbit_radius = body.get("orbit_radius", 0.0)
+            if orbit_speed == 0.0 or orbit_radius == 0.0:
+                self.recompute_orbit_parameters(body, force_recompute=True)
+                orbit_speed = body.get("orbit_speed", 0.0)
+
+            if effective_dt > 0.0 and orbit_speed != 0.0 and not np.isnan(orbit_speed):
+                old_angle = float(body.get("orbit_angle", 0.0))
+                e = float(body.get("eccentricity", 0.0))
+                if e > 0:
+                    e_safe = min(e, 0.999)
+                    speed_factor = ((1 + e_safe * math.cos(old_angle)) ** 2) / ((1 - e_safe**2) ** 1.5)
+                    angular_delta = orbit_speed * speed_factor * effective_dt
+                else:
+                    angular_delta = orbit_speed * effective_dt
+                body["orbit_angle"] = old_angle + angular_delta
+                while body["orbit_angle"] >= 2 * np.pi:
+                    body["orbit_angle"] -= 2 * np.pi
+                while body["orbit_angle"] < 0:
+                    body["orbit_angle"] += 2 * np.pi
+
+            self.compute_planet_position(body, parent)
+            if "visual_position" in body:
+                body["visual_position"] = body["position"].copy()
+            self._sync_planet_position_au(body, parent, scale_px)
+
+    def _get_body_draw_radius_px(self, body: dict, visual_radius_world: float) -> int:
+        """
+        Final on-screen draw radius (pixels) after zoom, with Alpha Centauri overrides.
+
+        At the system-wide zoom level every body would otherwise shrink to 1–2 px dots
+        and stars/planets become indistinguishable. For α Cen only: stars get a screen
+        floor, planets get a screen cap relative to their host star.
+        """
+        z = float(self.camera.zoom)
+        base = max(1, int(visual_radius_world * z))
+        if getattr(self, "_current_preset", None) != "alpha_centauri":
+            return base
+        btype = body.get("type")
+        if btype == "star":
+            return max(AC_SCREEN_STAR_MIN_PX, base)
+        if btype == "planet":
+            host = body.get("parent_obj")
+            if host is not None:
+                star_world = self.calculate_star_visual_radius(host, self.placed_bodies)
+                star_screen = max(AC_SCREEN_STAR_MIN_PX, int(star_world * z))
+            else:
+                star_screen = AC_SCREEN_STAR_MIN_PX
+            planet_cap = max(2, int(star_screen * AC_SCREEN_PLANET_MAX_FRAC))
+            return max(2, min(base, planet_cap))
+        return base
     
     def calculate_moon_visual_radius(self, moon_body: dict, placed_bodies: list) -> float:
         """
@@ -8544,6 +9321,30 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 offset_px = np.array([float(pos_au[0]) * AU_TO_PX, float(pos_au[1]) * AU_TO_PX], dtype=float)
                 star_body["position"] = screen_center + offset_px
 
+        # Stash each star's reference orbital radius (around the AB barycenter) so
+        # render_simulation can draw a full circle from t=0 instead of a growing
+        # trail. The AB binary is set up circular in this preset, and Proxima orbits
+        # AB on a near-circular wide orbit, so a single radius captures the geometry.
+        # Numbers come from get_alpha_centauri_system(): r_AB = 23.5, M_A = 1.10, M_B = 0.91.
+        ac_M_A, ac_M_B = 1.10, 0.91
+        ac_M_AB = ac_M_A + ac_M_B
+        ac_r_AB = 23.5  # AU, AB separation
+        ac_r_A = (ac_M_B / ac_M_AB) * ac_r_AB           # ~10.64 AU
+        ac_r_B = (ac_M_A / ac_M_AB) * ac_r_AB           # ~12.86 AU
+        ac_com_AB_x = (ac_M_A * 11.75 + ac_M_B * (-11.75)) / ac_M_AB  # ~+1.111 AU offset of AB-COM from origin
+        ac_a_Prox = 75.0
+        ac_r_Prox = ac_a_Prox - ac_com_AB_x             # Proxima's distance from AB barycenter ~73.89 AU
+        ac_star_orbit_radii_au = {
+            "Alpha Centauri A": ac_r_A,
+            "Alpha Centauri B": ac_r_B,
+            "Proxima Centauri": ac_r_Prox,
+        }
+        for name, star_body in stars_by_name.items():
+            r = ac_star_orbit_radii_au.get(name)
+            if r is not None:
+                star_body["nbody_orbit_radius_au"] = float(r)
+                star_body["nbody_orbit_center"] = "ab_barycenter"
+
         # Orbit grids were first built in place_object() while stars still overlapped at
         # screen center; after final star positions exist, recompute planet locations and
         # regenerate grids so ellipses stay centered on the correct host (avoids orphan rings).
@@ -8568,18 +9369,22 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         if self.placed_bodies:
             self.initialize_all_orbits()
 
-        # Fit all stars (A, B, Proxima) in view; companion distance is compressed in preset vs real ~10^4 AU
+        # Fit all stars (A, B, Proxima) in view; companion distance is compressed in preset vs real ~10^4 AU.
+        # Post-stability-fix Proxima sits at ~70 AU from the system COM (was 35 AU), so the system
+        # spans ~87 AU edge-to-edge -- needs zoom ~0.045 to fit. Lower floor (was 0.055) so the
+        # auto-fit math actually wins, and use a generous AU-based margin so Proxima is not clipped.
         stars_only = [b for b in self.placed_bodies if b.get("type") == "star"]
         if stars_only:
             xs = [float(s["position"][0]) for s in stars_only]
             ys = [float(s["position"][1]) for s in stars_only]
-            margin_px = 140.0
+            margin_au = 25.0  # ~25 AU of breathing room on each side, in pixel space
+            margin_px = margin_au * AU_TO_PX
             w_world = max(xs) - min(xs) + margin_px
             h_world = max(ys) - min(ys) + margin_px
             extent = max(w_world, h_world, 500.0)
             z_w = (self.width * 0.88) / extent
             z_h = (self.height * 0.74) / extent
-            self.camera.zoom = float(max(0.055, min(min(z_w, z_h), 0.5)))
+            self.camera.zoom = float(max(0.025, min(min(z_w, z_h), 0.5)))
             mid_x = (min(xs) + max(xs)) / 2.0
             mid_y = (min(ys) + max(ys)) / 2.0
             self.camera.offset = [
@@ -8607,7 +9412,8 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             self.selected_body_id = preferred.get("id")
             self.selected_body = preferred
 
-        # Single locked rate for α Cen; _on_preset_loaded applies time_scale when unpausing
+        # Default to 1 yr/sec (index 0) on load; user can ⏩ to 5 yr/sec or 10 yr/sec.
+        # _on_preset_loaded applies time_scale when unpausing.
         self.current_scale_index = 0
         self.last_pre_pause_scale_index = 0
         # Force N-body re-init on next frame (same as first-time load) so engine and POV match
@@ -9237,17 +10043,22 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             
             # Planet-specific: Habitable Zone with tooltip
             if body.get("type") == "planet":
-                # Get parent star and HZ info
-                parent_star = None
-                for star in self.placed_bodies:
-                    if star.get("type") == "star":
-                        parent_star = star
-                        break
-                
-                if parent_star:
-                    hz_inner = parent_star.get("hz_inner_au", 0.95)
-                    hz_outer = parent_star.get("hz_outer_au", 1.37)
-                    planet_au = body.get("semiMajorAxis", 1.0)
+                parent_star = body.get("parent_obj")
+                if parent_star is None and body.get("parent"):
+                    parent_star = next(
+                        (
+                            b
+                            for b in self.placed_bodies
+                            if b.get("name") == body["parent"] and b.get("type") == "star"
+                        ),
+                        None,
+                    )
+                if parent_star is not None:
+                    if parent_star.get("hz_inner_au") is None or parent_star.get("hz_outer_au") is None:
+                        self.create_habitable_zone(parent_star)
+                    hz_inner = float(parent_star.get("hz_inner_au", 0.751))
+                    hz_outer = float(parent_star.get("hz_outer_au", 1.774))
+                    planet_au = float(body.get("semiMajorAxis", 1.0))
                     in_hz = hz_inner <= planet_au <= hz_outer
                     hz_status = "Inside HZ" if in_hz else "Outside HZ"
                     curr_y = draw_stat("Habitable Zone:", hz_status, curr_y, tooltip_param="Habitable Zone")
@@ -9949,69 +10760,22 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                         continue
                 continue
 
-            # System Seed import modal: text input and Import/Cancel
+            # System Seed import modal: browse file, clipboard, or cancel
             if getattr(self, "system_seed_import_modal_visible", False):
-                if event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_ESCAPE:
-                        self.system_seed_import_modal_visible = False
-                        self.system_seed_import_text = ""
-                        continue
-                    if event.key == pygame.K_RETURN:
-                        seed_txt = (getattr(self, "system_seed_import_text", "") or "").strip()
-                        if not seed_txt:
-                            self.stability_warning_visible = True
-                            self.stability_warning_message = "Seed import failed: Seed does not exist"
-                        elif PERSISTENCE_AVAILABLE:
-                            try:
-                                payload, warning = load_system_seed(seed_txt)
-                                self._load_saved_system(payload)
-                                if warning:
-                                    self.stability_warning_visible = True
-                                    self.stability_warning_message = warning
-                            except Exception:
-                                self.stability_warning_visible = True
-                                self.stability_warning_message = "Seed import failed: Seed does not exist"
-                        self.system_seed_import_modal_visible = False
-                        self.system_seed_import_text = ""
-                        continue
-                    # Ctrl+V paste (best-effort)
-                    if (event.key == pygame.K_v) and (event.mod & pygame.KMOD_CTRL) and getattr(self, "_clipboard_available", False):
-                        try:
-                            data = pygame.scrap.get(pygame.SCRAP_TEXT)
-                            if data:
-                                pasted = data.decode("utf-8", errors="ignore")
-                                self.system_seed_import_text = (getattr(self, "system_seed_import_text", "") or "") + pasted
-                        except Exception:
-                            pass
-                        continue
-                    if event.key == pygame.K_BACKSPACE:
-                        self.system_seed_import_text = (getattr(self, "system_seed_import_text", "") or "")[:-1]
-                        continue
-                    if event.unicode and len(getattr(self, "system_seed_import_text", "")) < 20000:
-                        self.system_seed_import_text = (getattr(self, "system_seed_import_text", "") or "") + event.unicode
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    self.system_seed_import_modal_visible = False
                     continue
                 if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    if hasattr(self, "system_seed_import_confirm_rect") and self.system_seed_import_confirm_rect.collidepoint(event.pos):
-                        seed_txt = (getattr(self, "system_seed_import_text", "") or "").strip()
-                        if not seed_txt:
-                            self.stability_warning_visible = True
-                            self.stability_warning_message = "Seed import failed: Seed does not exist"
-                        elif PERSISTENCE_AVAILABLE:
-                            try:
-                                payload, warning = load_system_seed(seed_txt)
-                                self._load_saved_system(payload)
-                                if warning:
-                                    self.stability_warning_visible = True
-                                    self.stability_warning_message = warning
-                            except Exception:
-                                self.stability_warning_visible = True
-                                self.stability_warning_message = "Seed import failed: Seed does not exist"
-                        self.system_seed_import_modal_visible = False
-                        self.system_seed_import_text = ""
+                    if hasattr(self, "system_seed_import_browse_rect") and self.system_seed_import_browse_rect.collidepoint(event.pos):
+                        if self._import_system_seed_via_file_dialog():
+                            self.system_seed_import_modal_visible = False
+                        continue
+                    if hasattr(self, "system_seed_import_clipboard_rect") and self.system_seed_import_clipboard_rect.collidepoint(event.pos):
+                        if self._import_system_seed_from_clipboard():
+                            self.system_seed_import_modal_visible = False
                         continue
                     if hasattr(self, "system_seed_import_cancel_rect") and self.system_seed_import_cancel_rect.collidepoint(event.pos):
                         self.system_seed_import_modal_visible = False
-                        self.system_seed_import_text = ""
                         continue
                     if hasattr(self, "system_seed_import_modal_rect") and not self.system_seed_import_modal_rect.collidepoint(event.pos):
                         continue
@@ -10103,7 +10867,6 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                     export_dir = self.export_all()
                     if export_dir:
                         print(f"Export successful! Files saved to: {export_dir}")
-                        self.pending_screenshot_export_dir = export_dir
                         self._show_export_toast(export_dir)
                     self.show_export_panel = False
                     continue
@@ -10139,17 +10902,32 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                     if self.diagnostics_panel:
                         planet_sel = getattr(self, "selected_body", None)
                         if planet_sel and planet_sel.get("type") in ("planet", "moon"):
-                            self.diagnostics_panel._export_integrity_report()
-                            self._show_export_toast("Diagnostics export (JSON)")
+                            out_path = self.diagnostics_panel._export_integrity_report(self.create_export_directory())
+                            if out_path:
+                                self._show_export_toast(out_path)
+                            else:
+                                self._show_export_toast("Diagnostics integrity export failed")
                         else:
                             self._show_export_toast("Select planet in Diagnostics first")
+                    self.show_export_panel = False
+                    continue
+                elif hasattr(self, 'export_diag_bundle_button_rect') and self.export_diag_bundle_button_rect.collidepoint(event.pos):
+                    export_dir = self.create_export_directory()
+                    paths = self.export_diagnostics_bundle(export_dir)
+                    if paths:
+                        self._show_export_toast(export_dir)
+                    else:
+                        self._show_export_toast("No diagnostics outputs ready (run diagnostics first)")
                     self.show_export_panel = False
                     continue
                 elif hasattr(self, 'export_diag_sensitivity_button_rect') and self.export_diag_sensitivity_button_rect.collidepoint(event.pos):
                     if self.diagnostics_panel:
                         if getattr(self.diagnostics_panel.state, "sensitivity_computed", False):
-                            self.diagnostics_panel._export_sensitivity_report()
-                            self._show_export_toast("Diagnostics sensitivity export (JSON)")
+                            out_path = self.diagnostics_panel._export_sensitivity_report(self.create_export_directory())
+                            if out_path:
+                                self._show_export_toast(out_path)
+                            else:
+                                self._show_export_toast("Diagnostics sensitivity export failed")
                         else:
                             self._show_export_toast("Compute sensitivity in Diagnostics first")
                     self.show_export_panel = False
@@ -10157,8 +10935,11 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 elif hasattr(self, 'export_diag_convergence_button_rect') and self.export_diag_convergence_button_rect.collidepoint(event.pos):
                     if self.diagnostics_panel:
                         if getattr(self.diagnostics_panel.state, "uncertainty_computed", False):
-                            self.diagnostics_panel._export_convergence_plot()
-                            self._show_export_toast("Diagnostics convergence export (PNG)")
+                            out_path = self.diagnostics_panel._export_convergence_plot(self.create_export_directory())
+                            if out_path:
+                                self._show_export_toast(out_path)
+                            else:
+                                self._show_export_toast("Diagnostics convergence export failed")
                         else:
                             self._show_export_toast("Compute uncertainty in Diagnostics first")
                     self.show_export_panel = False
@@ -10195,8 +10976,13 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                     continue
                 elif hasattr(self, 'export_screenshot_button_rect') and self.export_screenshot_button_rect.collidepoint(event.pos):
                     export_dir = self.create_export_directory()
-                    self.pending_screenshot_export_dir = export_dir
-                    self._show_export_toast(export_dir)
+                    snap_path = self.export_orbit_snapshot(export_dir)
+                    if snap_path:
+                        self._show_export_toast(snap_path)
+                    elif getattr(self, "pending_screenshot_export_dir", None) == export_dir:
+                        self._show_export_toast(export_dir)
+                    else:
+                        self._show_export_toast("Orbit snapshot skipped")
                     self.show_export_panel = False
                     continue
             
@@ -14254,15 +15040,8 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                             self.system_menu_confirm_modal = True
                         elif option == "Import System Seed":
                             if PERSISTENCE_AVAILABLE:
-                                self.system_seed_import_modal_visible = True
-                                # Prefill from clipboard if available
-                                if getattr(self, "_clipboard_available", False):
-                                    try:
-                                        data = pygame.scrap.get(pygame.SCRAP_TEXT)
-                                        if data:
-                                            self.system_seed_import_text = data.decode("utf-8", errors="ignore")
-                                    except Exception:
-                                        pass
+                                if not self._import_system_seed_via_file_dialog():
+                                    self.system_seed_import_modal_visible = True
                         elif option == "Custom":
                             # Toggle the saved-systems dropdown (open/close on repeated clicks)
                             if getattr(self, "load_system_list_visible", False):
@@ -14466,6 +15245,101 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             # Close preset dropdown when switching tabs
             self.planet_preset_dropdown_visible = False
     
+    def _pick_system_seed_file(self) -> Optional[str]:
+        """Open a native file picker for a seed .txt file."""
+        root = None
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+
+            root = tk.Tk()
+            root.withdraw()
+            root.wm_attributes("-topmost", 1)
+            root.update()
+            initial = os.path.abspath("exports") if os.path.isdir("exports") else os.getcwd()
+            path = filedialog.askopenfilename(
+                parent=root,
+                title="Import System Seed",
+                initialdir=initial,
+                filetypes=[
+                    ("Seed text files", "*.txt"),
+                    ("All files", "*.*"),
+                ],
+            )
+            return path if path else None
+        except Exception as e:
+            print(f"Seed file picker failed: {e}")
+            return None
+        finally:
+            if root is not None:
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+
+    def _import_system_seed_text(self, seed_txt: str) -> bool:
+        """Decode a seed string and load the system. Returns True on success."""
+        seed_txt = (seed_txt or "").strip()
+        if not seed_txt:
+            self.stability_warning_visible = True
+            self.stability_warning_message = "Seed import failed: empty seed"
+            return False
+        if not PERSISTENCE_AVAILABLE:
+            self.stability_warning_visible = True
+            self.stability_warning_message = "Seed import failed: persistence unavailable"
+            return False
+        try:
+            payload, warning = load_system_seed(seed_txt)
+            self._load_saved_system(payload)
+            if warning:
+                self.stability_warning_visible = True
+                self.stability_warning_message = warning
+            self._show_export_toast("System seed imported")
+            return True
+        except Exception as e:
+            print(f"Seed import failed: {e}")
+            self.stability_warning_visible = True
+            self.stability_warning_message = "Seed import failed: invalid or corrupted seed"
+            return False
+
+    def _import_system_seed_from_file(self, filepath: str) -> bool:
+        """Read a seed .txt file and import it."""
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                seed_txt = f.read()
+        except Exception as e:
+            print(f"Could not read seed file: {e}")
+            self.stability_warning_visible = True
+            self.stability_warning_message = "Seed import failed: could not read file"
+            return False
+        return self._import_system_seed_text(seed_txt)
+
+    def _import_system_seed_via_file_dialog(self) -> bool:
+        """Browse for a seed file and import it. Returns True if a file was imported."""
+        path = self._pick_system_seed_file()
+        if not path:
+            return False
+        return self._import_system_seed_from_file(path)
+
+    def _import_system_seed_from_clipboard(self) -> bool:
+        """Import a seed pasted in the OS clipboard (best-effort)."""
+        if not getattr(self, "_clipboard_available", False):
+            self.stability_warning_visible = True
+            self.stability_warning_message = "Seed import failed: clipboard unavailable"
+            return False
+        try:
+            data = pygame.scrap.get(pygame.SCRAP_TEXT)
+            if not data:
+                self.stability_warning_visible = True
+                self.stability_warning_message = "Seed import failed: clipboard is empty"
+                return False
+            return self._import_system_seed_text(data.decode("utf-8", errors="ignore"))
+        except Exception as e:
+            print(f"Clipboard seed import failed: {e}")
+            self.stability_warning_visible = True
+            self.stability_warning_message = "Seed import failed: could not read clipboard"
+            return False
+
     def _show_export_toast(self, path_or_dir: str):
         """Show 'Exported to [path]' toast for a few seconds."""
         self.export_toast_message = f"Exported to {path_or_dir}"
@@ -14558,13 +15432,12 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 - "Habitability Index Chart"
                 - "Orbital State Snapshot"
                 - "Physics & ML Integrity Report"
-                - "Export Full Package"
+                - "Export All"
         """
-        if option == "Export Full Package":
+        if option in ("Export All", "Export Full Package"):
             export_dir = self.export_all()
             if export_dir:
                 print(f"Export successful! Files saved to: {export_dir}")
-                self.pending_screenshot_export_dir = export_dir
                 self._show_export_toast(export_dir)
         elif option == "Mission Data Table":
             export_dir = self.create_export_directory()
@@ -14582,10 +15455,15 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             if chart_path:
                 print(f"Chart exported to: {chart_path}")
                 self._show_export_toast(chart_path)
-        elif option == "Orbital State Snapshot":
+        elif option in (ORBIT_SNAPSHOT_MENU_LABEL, "Orbital State Snapshot"):
             export_dir = self.create_export_directory()
-            self.pending_screenshot_export_dir = export_dir
-            self._show_export_toast(export_dir)
+            snap_path = self.export_orbit_snapshot(export_dir)
+            if snap_path:
+                self._show_export_toast(snap_path)
+            elif getattr(self, "pending_screenshot_export_dir", None) == export_dir:
+                self._show_export_toast(export_dir)
+            else:
+                self._show_export_toast("Orbit snapshot skipped")
         elif option == "Physics & ML Integrity Report":
             export_dir = self.create_export_directory()
             pdf_path = self.export_physics_integrity_report(export_dir)
@@ -14624,24 +15502,46 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         if not body.get("orbit_enabled", True):
             return
 
-        # Alpha Centauri (N-body triple): integrated trails for stars/planets wander off the
-        # Kepler orbit rings and look like random scribbles. Keep the static orbit grid only.
-        if getattr(self, "_current_preset", None) == "alpha_centauri":
-            t = body.get("type")
-            if t in ("star", "planet"):
-                return
-            
         if "orbit_points" not in body or len(body["orbit_points"]) < 2:
             return
-        
-        # For moons, orbit points are stored relative to planet
-        # For planets and stars, orbit points are in absolute world coordinates
+
+        # In N-body mode (Alpha Centauri etc.) the static reference rings already
+        # show the orbital geometry as a full closed loop from t=0:
+        #   - Stars: circles drawn around the AB barycenter (_draw_nbody_star_rings)
+        #   - Planets: existing Kepler `orbit_grid_points` ellipses around their host
+        # Drawing the integrated trail on top of those just adds a noisy, slowly-growing
+        # line that confuses "what orbits what". So skip it for stars and planets here.
+        # Moons keep their trail (they have no static reference ring of their own).
+        if (
+            getattr(self, "physics_mode", "keplerian") == "nbody"
+            and body.get("type") in ("star", "planet")
+        ):
+            return
+
+        # Trail point storage convention:
+        #   - Moons (always): stored relative to parent planet so the trail follows
+        #     a moving planet cleanly.
+        #   - Planets in N-body mode: stored relative to host star (set by the
+        #     accumulator below when 'orbit_points_relative' == True). Lets us see
+        #     the planet's orbit-around-host even though the host is moving.
+        #   - Planets in Keplerian mode + stars in N-body: stored as absolute
+        #     world positions.
+        relative_to = None
         if body["type"] == "moon" and body.get("parent_obj") is not None:
-            # Moon: convert relative points to world coordinates by adding planet position
-            planet = body["parent_obj"]
-            pts = [self.world_to_screen(planet["position"] + p) for p in body["orbit_points"]]
+            relative_to = body["parent_obj"]
+        elif (
+            body["type"] == "planet"
+            and body.get("orbit_points_relative", False)
+            and body.get("parent_obj") is not None
+        ):
+            relative_to = body["parent_obj"]
+
+        if relative_to is not None:
+            host_pos = relative_to.get("position")
+            if host_pos is None:
+                return
+            pts = [self.world_to_screen(host_pos + p) for p in body["orbit_points"]]
         else:
-            # Planet or star: convert absolute world coordinates to screen coordinates
             pts = [self.world_to_screen(p) for p in body["orbit_points"]]
         
         # Choose color based on body type
@@ -15329,6 +16229,14 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         prev_mode = getattr(self, "_physics_mode_prev", "keplerian")
         self.physics_mode = SimulationEngine.physics_mode(self.placed_bodies)
         engine = getattr(self, "_simulation_engine", None)
+
+        # On any physics-mode transition, clear accumulated orbit_points: their
+        # storage convention (relative-to-host vs. absolute) differs between
+        # modes, and mixing the two would draw a visually nonsensical hybrid trail.
+        if prev_mode != self.physics_mode:
+            for body in self.placed_bodies:
+                if "orbit_points" in body:
+                    body["orbit_points"].clear()
         
         if self.physics_mode == "nbody" and engine is not None:
             # ---------- Mode B: N-body (Leapfrog), barycentric, sub-stepping ----------
@@ -15354,6 +16262,27 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                     com_shift_px = com_au * scale_px
 
                 engine._initialize_nbody_state(self.placed_bodies, scale_px)
+
+                # α Cen: snap planets onto their Kepler rings (visual semi-major axes).
+                # N-body init may leave planet position_au from pixel coords that do not
+                # match the drawn orbit grid; host-centered Kepler fixes that at handover.
+                if getattr(self, "_current_preset", None) == "alpha_centauri":
+                    for p in planets:
+                        if p.get("is_destroyed", False):
+                            continue
+                        parent = p.get("parent_obj")
+                        if parent is None and p.get("parent"):
+                            parent = next(
+                                (b for b in self.placed_bodies if b.get("name") == p["parent"] and b.get("type") == "star"),
+                                None,
+                            )
+                            if parent is not None:
+                                p["parent_obj"] = parent
+                        if parent is not None:
+                            if p.get("orbit_speed", 0.0) == 0.0:
+                                self.recompute_orbit_parameters(p, force_recompute=True)
+                            self.compute_planet_position(p, parent)
+                            self._sync_planet_position_au(p, parent, scale_px)
 
                 if com_shift_px is not None:
                     # Engine has subtracted COM (in AU) from all positions; in pixel space this is
@@ -15384,15 +16313,29 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             n_sub = 20
             if effective_dt > 0:
                 n_sub = max(20, int(math.ceil(effective_dt / 0.001)))
+            # Alpha Centauri: integrate stars only (triple N-body). Planets stay on the
+            # drawn Kepler rings around their host via _update_ac_planets_keplerian.
+            ac_preset = getattr(self, "_current_preset", None) == "alpha_centauri"
+            nbody_integrate = (
+                [b for b in stars if not b.get("is_destroyed", False)]
+                if ac_preset
+                else self.placed_bodies
+            )
             if effective_dt > 0:
-                engine.step_nbody(effective_dt, self.placed_bodies, n_sub=n_sub, scale_px_per_au=scale_px)
+                engine.step_nbody(effective_dt, nbody_integrate, n_sub=n_sub, scale_px_per_au=scale_px)
             else:
-                for b in self.placed_bodies:
+                for b in nbody_integrate:
                     if b.get("position_au") is not None:
                         b["position"] = np.array(b["position_au"]) * scale_px
-            for b in self.placed_bodies:
-                if "visual_position" in b:
-                    b["visual_position"] = b["position"].copy()
+            if ac_preset:
+                self._update_ac_planets_keplerian(planets, effective_dt, scale_px)
+                for b in stars:
+                    if "visual_position" in b:
+                        b["visual_position"] = b["position"].copy()
+            else:
+                for b in self.placed_bodies:
+                    if "visual_position" in b:
+                        b["visual_position"] = b["position"].copy()
             # Collision/destruction: record time and notification for newly destroyed bodies
             if not hasattr(self, "destruction_notifications"):
                 self.destruction_notifications = []
@@ -15401,7 +16344,10 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                     b["_destroyed_at_time"] = time.time()
                     name = b.get("display_name", b.get("name", "Body"))
                     self.destruction_notifications.append(f"{name} destroyed via Stellar Engulfment/Collision")
-            # N-body: accumulate orbit_points (trail) for stars, planets, and moons so orbit lines are visible
+            # N-body: accumulate orbit_points (trail) for stars, planets, and moons so orbit lines are visible.
+            # Planets and moons store *relative to their parent* so the trail looks like a clean
+            # orbit-around-host even though the host is moving. Stars store absolute positions:
+            # in the system COM frame, A and B trace small mutual circles, Proxima a wide circle.
             if effective_dt > 0:
                 for body in self.placed_bodies:
                     if body.get("is_destroyed", False):
@@ -15414,11 +16360,17 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                         body["orbit_points"] = []
                     if "max_orbit_points" not in body:
                         body["max_orbit_points"] = 2000
-                    if body["type"] == "moon" and body.get("parent_obj") is not None:
-                        parent = body["parent_obj"]
+
+                    parent = body.get("parent_obj")
+                    if body["type"] == "moon" and parent is not None:
                         body["orbit_points"].append((body["position"] - parent["position"]).copy())
+                        body["orbit_points_relative"] = True
+                    elif body["type"] == "planet" and parent is not None:
+                        body["orbit_points"].append((body["position"] - parent["position"]).copy())
+                        body["orbit_points_relative"] = True
                     else:
                         body["orbit_points"].append(body["position"].copy())
+                        body["orbit_points_relative"] = False
                     if len(body["orbit_points"]) > body["max_orbit_points"]:
                         body["orbit_points"].pop(0)
             # N-body habitability: time-averaged flux and thermal instability (every ~60 frames)
@@ -15570,7 +16522,9 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                     if body["rotation_angle"] >= 2 * np.pi:
                         body["rotation_angle"] -= 2 * np.pi
                     
-                    # Store orbit points only when time progresses and orbit is enabled
+                    # Store orbit points only when time progresses and orbit is enabled.
+                    # Keplerian mode: planets orbit a stationary star, so absolute world
+                    # positions form a clean Kepler ellipse — flag accordingly.
                     if effective_dt > 0.0 and body.get("orbit_enabled", True):
                         if "orbit_points" not in body:
                             body["orbit_points"] = []
@@ -15578,6 +16532,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                             body["max_orbit_points"] = 2000
                         
                         body["orbit_points"].append(body["position"].copy())
+                        body["orbit_points_relative"] = False
                         
                         # Trim to max_orbit_points if exceeded
                         if len(body["orbit_points"]) > body["max_orbit_points"]:
@@ -15746,9 +16701,11 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                             # Store relative offset from planet
                             relative_offset = body["position"] - p["position"]
                             body["orbit_points"].append(relative_offset.copy())
+                            body["orbit_points_relative"] = True
                         else:
                             # Planets store absolute position
                             body["orbit_points"].append(body["position"].copy())
+                            body["orbit_points_relative"] = False
                         
                         # Trim to max_orbit_points if exceeded
                         if len(body["orbit_points"]) > body["max_orbit_points"]:
@@ -17451,6 +18408,13 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                         color = tuple(int(c * fade_factor) for c in color)
                         
                     pygame.draw.lines(self.screen, color, True, screen_points, max(1, int(2 * self.camera.zoom)))
+
+        # N-body reference rings for stars (Alpha Centauri triple). Stars don't have
+        # a single "parent" body, so we draw them as circles centered on the current
+        # AB barycenter using each star's pre-computed nbody_orbit_radius_au. This
+        # gives a full ring visible from t=0 instead of a slowly-accumulating trail.
+        if getattr(self, "physics_mode", "keplerian") == "nbody":
+            self._draw_nbody_star_rings()
         
         # Draw habitable zones for all stars (before drawing bodies, after orbit grids)
         # DISABLED: Habitable zone visualization removed per user request
@@ -17593,7 +18557,8 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 pos = self.world_to_screen(body["position"])
                 # Calculate visual radius using perceptual scaling with orbit clamping
                 visual_radius = self.calculate_star_visual_radius(body, self.placed_bodies)
-                pygame.draw.circle(self.screen, color, (int(pos[0]), int(pos[1])), max(1, int(visual_radius * self.camera.zoom)))
+                draw_r = self._get_body_draw_radius_px(body, visual_radius)
+                pygame.draw.circle(self.screen, color, (int(pos[0]), int(pos[1])), draw_r)
             else:
                 self.draw_rotating_body(body, color)
             
@@ -18976,12 +19941,13 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
     def create_habitable_zone(self, star):
         """
         Create a habitable zone (HZ) annulus surface for a star.
-        Uses Kopparapu-style approximation:
-        - inner_HZ_AU = sqrt(L / 1.1)
-        - outer_HZ_AU = sqrt(L / 0.53)
+        Uses Kopparapu et al. (2013) conservative limits (ApJ 765, 131):
+        - Inner: Recent Venus (S_eff polynomial in T_eff)
+        - Outer: Early Mars (S_eff polynomial in T_eff)
+        - r_AU = sqrt(L / S_eff); T* = T_eff - 5780 K (Table 3).
         
         Args:
-            star: Star object with 'luminosity' attribute
+            star: Star object with 'luminosity' and temperature (K)
             
         Returns:
             pygame.Surface with SRCALPHA containing the HZ annulus, or None if invalid
@@ -18989,13 +19955,24 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         if star.get("type") != "star":
             return None
         
-        luminosity = star.get("luminosity", 1.0)
+        luminosity = float(star.get("luminosity", 1.0))
         if luminosity <= 0:
             return None
-        
-        # Calculate HZ boundaries in AU
-        inner_HZ_AU = np.sqrt(luminosity / 1.1)
-        outer_HZ_AU = np.sqrt(luminosity / 0.53)
+
+        try:
+            from src.physics.kopparapu_hz import kopparapu_hz_boundaries_au
+        except ImportError:
+            from physics.kopparapu_hz import kopparapu_hz_boundaries_au
+
+        teff = float(star.get("star_temperature", star.get("temperature", 5780.0)))
+        inner_HZ_AU, outer_HZ_AU, s_eff_in, s_eff_out = kopparapu_hz_boundaries_au(
+            luminosity, teff
+        )
+        star["hz_inner_au"] = float(inner_HZ_AU)
+        star["hz_outer_au"] = float(outer_HZ_AU)
+        star["hz_s_eff_inner"] = float(s_eff_in)
+        star["hz_s_eff_outer"] = float(s_eff_out)
+        star["hz_model"] = "kopparapu_2013_conservative_rv_em"
         
         # Convert to pixels using perceptual scaling
         inner_HZ_px = int(self.get_visual_orbit_radius(inner_HZ_AU))
@@ -19106,7 +20083,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             # Stars: radius is already in pixels
             visual_radius = body["radius"]
         
-        radius = max(1, int(visual_radius * self.camera.zoom))
+        radius = self._get_body_draw_radius_px(body, visual_radius)
         
         # Use visual_position if correcting orbit, otherwise use position
         render_pos = body.get("visual_position", body["position"])
@@ -19433,10 +20410,14 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         # Deferred screenshot: capture now (frame has no export UI, camera is fit-to-view), then restore camera
         if self.pending_screenshot_export_dir:
             try:
-                screenshot_path = self.export_screenshot(self.pending_screenshot_export_dir)
-                print(f"Screenshot exported to: {screenshot_path}")
+                export_dir = self.pending_screenshot_export_dir
+                if MATPLOTLIB_AVAILABLE:
+                    snapshot_path = self.export_simulation_figure(export_dir)
+                else:
+                    snapshot_path = self._export_orbit_snapshot_pygame(export_dir)
+                print(f"Orbit snapshot exported to: {snapshot_path}")
             except Exception as e:
-                print(f"Error exporting screenshot: {e}")
+                print(f"Error exporting orbit snapshot: {e}")
                 traceback.print_exc()
             if self.pending_screenshot_restore_camera:
                 restore_zoom, restore_offset = self.pending_screenshot_restore_camera
@@ -20456,8 +21437,19 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             else:
                 body = self.selected_body
             
-            # Find host star (simplified: take the first star found)
-            star = next((b for b in self.placed_bodies if b.get("type") == "star"), None)
+            # Host star: parent_obj, then parent name, then first star (legacy fallback)
+            star = body.get("parent_obj")
+            if star is None and body.get("parent"):
+                star = next(
+                    (
+                        b
+                        for b in self.placed_bodies
+                        if b.get("name") == body["parent"] and b.get("type") == "star"
+                    ),
+                    None,
+                )
+            if star is None:
+                star = next((b for b in self.placed_bodies if b.get("type") == "star"), None)
             if star:
                 # ML path - use canonical adapter with validation
                 ml_score, diagnostics = predict_with_simulation_body(

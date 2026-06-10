@@ -11,7 +11,11 @@ class Camera:
     width: int
     height: int
     zoom: float = 0.6
-    zoom_min: float = 0.02
+    # zoom_min lowered from 0.02 -> 0.01 so the user can pull back far enough
+    # to see the full Alpha Centauri triple (~150 AU span) plus its companions
+    # with comfortable margin. At zoom=0.01, AU_TO_PX=400 -> 4 px/AU,
+    # so a 1920 px screen shows 480 AU horizontally.
+    zoom_min: float = 0.01
     zoom_max: float = 3.0
     offset: List[float] = field(default_factory=list)
     last_zoom_for_orbits: float = 0.6
