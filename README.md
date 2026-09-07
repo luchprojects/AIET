@@ -1,6 +1,8 @@
-# AIET — Artificial Intelligence for Extraterrestrial
+# AIET v2.0 — Artificial Intelligence for Extraterrestrial
 
 AIET is a physics-informed machine learning and visualization platform for the exploratory analysis of exoplanet habitability using data from the NASA Exoplanet Archive.
+
+> **Development:** `main` is the working tree (v2 in progress). Official downloads are GitHub Releases (`v1.0` now).
 
 ## Project Purpose
 
@@ -19,7 +21,7 @@ AIET requires **Python 3.11+** (64-bit). Clone the repository and initialize the
 
 ```bash
 # Clone the repository
-git clone [https://github.com/yourusername/AIET.git](https://github.com/yourusername/AIET.git)
+git clone https://github.com/luchprojects/AIET.git
 cd AIET
 
 # Initialize virtual environment

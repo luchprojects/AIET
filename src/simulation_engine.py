@@ -3,8 +3,9 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 try:
-    from ml_habitability import MLHabitabilityCalculator
+    from src.ml.ml_habitability import MLHabitabilityCalculator
 except ImportError:
+    # xgboost or the model file may be unavailable; engine runs without ML scoring.
     MLHabitabilityCalculator = None
 
 # Mass conversion: 1 M_sun = 333,000 M_earth (matches main_window.py convention).
@@ -361,10 +362,8 @@ class SimulationEngine:
             if other != body:
                 # Convert mass from Earth masses to Solar masses for the calculation
                 # if the other body is a star, mass might already be in solar masses?
-                # Looking at main.py, sun mass is 1.0 (Solar mass), planets are in Earth masses.
-                # This is inconsistent. Let's assume stars are in Solar masses and planets in Earth masses.
-                # M_sun = 333,030 M_earth
-                other_mass_solar = other.mass if other.type == 'star' else other.mass / 333030.0
+                # Stars are in Solar masses, planets in Earth masses.
+                other_mass_solar = other.mass if other.type == 'star' else other.mass / _M_EARTH_PER_M_SUN
                 
                 r = other.position - body.position
                 r_mag = np.linalg.norm(r)
@@ -409,7 +408,10 @@ class SimulationEngine:
                 "st_lum": star.lum
             }
             # The ML model returns percentage (0-100)
-            return self.ml_calculator.predict(features)
+            try:
+                return self.ml_calculator.predict(features)
+            except Exception as e:
+                print(f"[ML] Habitability prediction failed for {body.name}: {e}; using basic fallback")
         
         # Fallback to basic calculation if ML is not available
         score = 0.0

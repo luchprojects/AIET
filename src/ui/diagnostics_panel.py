@@ -83,37 +83,8 @@ class IntegratorValidationResult:
     energy_history: List[float] = field(default_factory=list)
 
 
-# Panel configuration
-PANEL_CONFIG = {
-    "width": 380,
-    "min_height": 400,
-    "padding": 18,
-    "line_spacing": 22,
-    "section_spacing": 28,
-    "button_height": 32,
-    "button_spacing": 10,
-    "border_radius": 8,
-    
-    # Colors (professional, muted)
-    "bg_color": (35, 38, 48),
-    "border_color": (100, 105, 120),
-    "header_color": (140, 180, 220),
-    "label_color": (180, 180, 185),
-    "value_color": (240, 240, 245),
-    "section_bg": (42, 45, 55),
-    
-    # Status colors (muted, professional)
-    "status_green": (80, 160, 100),
-    "status_yellow": (180, 160, 80),
-    "status_red": (180, 90, 90),
-    "status_gray": (120, 120, 130),
-    
-    # Button colors
-    "button_normal": (60, 65, 80),
-    "button_hover": (75, 80, 95),
-    "button_text": (220, 220, 225),
-    "button_border": (90, 95, 110),
-}
+from src.ui.theme import DIAGNOSTICS_STYLE as PANEL_CONFIG
+from src.ui.theme import THEME, draw_close_x, draw_shadow, draw_toolbar_button
 
 # Thresholds for status indicators
 THRESHOLDS = {
@@ -181,7 +152,7 @@ class ScientificDiagnosticsPanel:
         """Initialize font references from visualizer."""
         if self._fonts_initialized:
             return
-        self.title_font = self.viz.subtitle_font
+        self.title_font = getattr(self.viz, "headline_font", self.viz.subtitle_font)
         self.label_font = self.viz.tiny_font
         self.value_font = self.viz.tiny_font
         self.button_font = self.viz.tiny_font
@@ -242,34 +213,28 @@ class ScientificDiagnosticsPanel:
         self._init_fonts()
         
         self.toggle_button_rect = self.get_toggle_button_rect()
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self.viz._mouse_pos() if hasattr(self.viz, "_mouse_pos") else pygame.mouse.get_pos()
         is_hover = self.toggle_button_rect.collidepoint(mouse_pos)
         
-        # Flat button colors (no transparency)
+        theme = getattr(self.viz, "theme", THEME)
         about_open = bool(getattr(self.viz, "show_about_panel", False))
-        if self.visible:
-            base_bg = (70, 75, 90)
-        elif is_hover:
-            base_bg = (65, 70, 85)
-        else:
-            base_bg = (50, 55, 70)
 
-        def _under_black_overlay(rgb, alpha=180):
-            # Emulate being drawn under the About overlay (black with alpha=180).
+        def _under_scrim(rgb, alpha=THEME.overlay_scrim[3]):
+            # Emulate being drawn under the About scrim so the button doesn't pop through it.
             f = max(0.0, min(1.0, 1.0 - (alpha / 255.0)))
             return (int(rgb[0] * f), int(rgb[1] * f), int(rgb[2] * f))
 
-        bg_color = _under_black_overlay(base_bg, 180) if about_open else base_bg
-        
-        # Draw flat button background
-        pygame.draw.rect(self.screen, bg_color, self.toggle_button_rect, border_radius=4)
-        
-        # Subtle border
-        border = _under_black_overlay((80, 85, 100), 180) if about_open else (80, 85, 100)
-        pygame.draw.rect(self.screen, border, self.toggle_button_rect, 1, border_radius=4)
+        if about_open:
+            fill = _under_scrim(theme.panel_elevated)
+            border = _under_scrim(theme.panel_border)
+            pygame.draw.rect(self.screen, fill, self.toggle_button_rect, border_radius=theme.radius_sm)
+            pygame.draw.rect(self.screen, border, self.toggle_button_rect, 1, border_radius=theme.radius_sm)
+            text_color = _under_scrim(theme.text_secondary)
+        else:
+            draw_toolbar_button(self.screen, self.toggle_button_rect, hover=is_hover, active=self.visible, theme=theme)
+            text_color = theme.text_primary if (is_hover or self.visible) else theme.text_secondary
         
         label = "Diagnostics" if not self.visible else "Hide Diag."
-        text_color = _under_black_overlay((220, 220, 225), 180) if about_open else (220, 220, 225)
         text_surf = self.button_font.render(label, True, text_color)
         text_rect = text_surf.get_rect(center=self.toggle_button_rect.center)
         self.screen.blit(text_surf, text_rect)
@@ -301,17 +266,19 @@ class ScientificDiagnosticsPanel:
         
         self.panel_rect = pygame.Rect(panel_x, panel_y, panel_width, panel_height)
         
-        shadow = self.panel_rect.copy()
-        shadow.move_ip(4, 4)
-        pygame.draw.rect(self.screen, (15, 15, 20, 150), shadow, border_radius=cfg["border_radius"])
-        
+        theme = getattr(self.viz, "theme", THEME)
+        draw_shadow(self.screen, self.panel_rect, radius=cfg["border_radius"], offset=6, alpha=140)
         pygame.draw.rect(self.screen, cfg["bg_color"], self.panel_rect, 
                          border_radius=cfg["border_radius"])
         pygame.draw.rect(self.screen, cfg["border_color"], self.panel_rect, 
-                         2, border_radius=cfg["border_radius"])
+                         1, border_radius=cfg["border_radius"])
+        # Accent stripe matches modal/popover language
+        stripe = pygame.Rect(self.panel_rect.left + cfg["border_radius"], self.panel_rect.top,
+                             self.panel_rect.width - 2 * cfg["border_radius"], 2)
+        pygame.draw.rect(self.screen, theme.accent, stripe)
         
         title = self.title_font.render("Scientific Diagnostics", True, cfg["value_color"])
-        title_rect = title.get_rect(midtop=(self.panel_rect.centerx, self.panel_rect.top + 12))
+        title_rect = title.get_rect(midleft=(self.panel_rect.left + cfg["padding"], self.panel_rect.top + 24))
         self.screen.blit(title, title_rect)
         
         close_size = 18
@@ -320,11 +287,8 @@ class ScientificDiagnosticsPanel:
             self.panel_rect.top + 10,
             close_size, close_size
         )
-        pygame.draw.line(self.screen, cfg["label_color"],
-                         self.close_button_rect.topleft, self.close_button_rect.bottomright, 2)
-        pygame.draw.line(self.screen, cfg["label_color"],
-                         (self.close_button_rect.left, self.close_button_rect.bottom),
-                         (self.close_button_rect.right, self.close_button_rect.top), 2)
+        mouse_pos = self.viz._mouse_pos() if hasattr(self.viz, "_mouse_pos") else pygame.mouse.get_pos()
+        draw_close_x(self.screen, self.close_button_rect, hover=self.close_button_rect.collidepoint(mouse_pos), theme=theme)
         
         content_rect = pygame.Rect(
             self.panel_rect.left + 5,
@@ -371,12 +335,12 @@ class ScientificDiagnosticsPanel:
         import pygame
         cfg = PANEL_CONFIG
         
-        header_rect = pygame.Rect(cfg["padding"] - 5, y, 
-                                   surface.get_width() - 2 * cfg["padding"] + 10, 24)
-        pygame.draw.rect(surface, cfg["section_bg"], header_rect, border_radius=4)
-        
-        header = self.title_font.render(text, True, cfg["header_color"])
-        surface.blit(header, (cfg["padding"], y + 3))
+        # Uppercase tracked label + hairline: section rhythm without a filled bar
+        header = self.label_font.render(text.upper(), True, THEME.text_tertiary)
+        surface.blit(header, (cfg["padding"], y + 6))
+        line_y = y + 6 + header.get_height() + 4
+        pygame.draw.line(surface, cfg["border_color"],
+                         (cfg["padding"], line_y), (surface.get_width() - cfg["padding"], line_y), 1)
         
         return y + 28
     
@@ -399,8 +363,7 @@ class ScientificDiagnosticsPanel:
         
         if status_color:
             import pygame
-            indicator_rect = pygame.Rect(cfg["padding"], y + 4, 4, 10)
-            pygame.draw.rect(surface, status_color, indicator_rect)
+            pygame.draw.circle(surface, status_color, (cfg["padding"] + 2, y + 8), 3)
         
         return y + cfg["line_spacing"]
     
@@ -437,16 +400,18 @@ class ScientificDiagnosticsPanel:
         btn_rect = pygame.Rect(cfg["padding"], y, btn_width, cfg["button_height"])
         
         if computing:
-            color = cfg["status_gray"]
+            color = THEME.disabled
             label = "Computing..."
+            text_color = THEME.text_tertiary
         else:
             color = cfg["button_normal"]
             label = text
+            text_color = cfg["button_text"]
         
-        pygame.draw.rect(surface, color, btn_rect, border_radius=4)
-        pygame.draw.rect(surface, cfg["button_border"], btn_rect, 1, border_radius=4)
+        pygame.draw.rect(surface, color, btn_rect, border_radius=THEME.radius_sm)
+        pygame.draw.rect(surface, cfg["button_border"], btn_rect, 1, border_radius=THEME.radius_sm)
         
-        text_surf = self.button_font.render(label, True, cfg["button_text"])
+        text_surf = self.button_font.render(label, True, text_color)
         text_rect = text_surf.get_rect(center=btn_rect.center)
         surface.blit(text_surf, text_rect)
         
@@ -651,12 +616,12 @@ class ScientificDiagnosticsPanel:
         track_height = content_rect.height
         
         track_rect = pygame.Rect(scrollbar_x, content_rect.top, scrollbar_width, track_height)
-        pygame.draw.rect(self.screen, (50, 50, 60), track_rect, border_radius=3)
+        pygame.draw.rect(self.screen, THEME.panel_elevated, track_rect, border_radius=3)
         
         thumb_height = max(20, int(track_height * track_height / (self.max_scroll + track_height)))
         thumb_y = content_rect.top + int((track_height - thumb_height) * self.scroll_y / self.max_scroll)
         thumb_rect = pygame.Rect(scrollbar_x, thumb_y, scrollbar_width, thumb_height)
-        pygame.draw.rect(self.screen, (100, 105, 115), thumb_rect, border_radius=3)
+        pygame.draw.rect(self.screen, THEME.text_tertiary, thumb_rect, border_radius=3)
     
     def _get_status_color(self, value: float, good_threshold: float, 
                           marginal_threshold: float) -> Tuple[int, int, int]:
@@ -736,7 +701,8 @@ class ScientificDiagnosticsPanel:
                     return True
         
         if event.type == pygame.MOUSEWHEEL and self.visible:
-            if self.panel_rect and self.panel_rect.collidepoint(pygame.mouse.get_pos()):
+            mouse_pos = self.viz._mouse_pos() if hasattr(self.viz, "_mouse_pos") else pygame.mouse.get_pos()
+            if self.panel_rect and self.panel_rect.collidepoint(mouse_pos):
                 self.scroll_y -= event.y * 30
                 self.scroll_y = max(0, min(self.scroll_y, self.max_scroll))
                 return True
@@ -1040,8 +1006,8 @@ class ScientificDiagnosticsPanel:
         w = surface.get_width() - 2 * cfg["padding"]
         h = 34
         rect = pygame.Rect(cfg["padding"], y, w, h)
-        pygame.draw.rect(surface, (30, 33, 42), rect, border_radius=4)
-        pygame.draw.rect(surface, (80, 90, 110), rect, 1, border_radius=4)
+        pygame.draw.rect(surface, THEME.field_bg, rect, border_radius=THEME.radius_sm)
+        pygame.draw.rect(surface, THEME.panel_border, rect, 1, border_radius=THEME.radius_sm)
 
         if not series or len(series) < 2:
             return y + h + 6
@@ -1073,10 +1039,10 @@ class ScientificDiagnosticsPanel:
             pts.append((int(x), int(yv)))
 
         # zero line
-        pygame.draw.line(surface, (70, 75, 90), (x0, y_mid), (x1, y_mid), 1)
-        pygame.draw.lines(surface, (150, 190, 255), False, pts, 2)
+        pygame.draw.line(surface, THEME.panel_border, (x0, y_mid), (x1, y_mid), 1)
+        pygame.draw.lines(surface, THEME.accent_soft, False, pts, 2)
 
-        label = self.label_font.render("ΔE/E0", True, (190, 195, 210))
+        label = self.label_font.render("ΔE/E0", True, THEME.text_secondary)
         surface.blit(label, (rect.left + 8, rect.top + 6))
 
         return y + h + 6

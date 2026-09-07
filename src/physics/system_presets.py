@@ -14,10 +14,6 @@ Units:
 
 from typing import Any, Dict, List
 
-# Extra multiplier on TRAPPIST-1 semi-major axes so orbit rings stay clearly separated
-# on screen (planet discs are perceptually scaled and would otherwise overlap).
-TRAPPIST_ORBIT_VISUAL_SPREAD = 1.38
-
 
 def get_blank_system() -> List[Dict[str, Any]]:
     """
@@ -389,7 +385,7 @@ def get_trappist1_system() -> List[Dict[str, Any]]:
                 # Measured / well-constrained
                 "mass": mass_earth,  # M_earth
                 "radius": radius_earth,  # R_earth
-                "semi_major_axis": semi_major_axis_au * TRAPPIST_ORBIT_VISUAL_SPREAD,  # AU
+                "semi_major_axis": semi_major_axis_au,  # AU (NASA archive)
                 "orbital_period": orbital_period_days,  # days
                 "eccentricity": eccentricity,
                 "stellarFlux": stellar_flux_se,  # S_earth
@@ -402,16 +398,14 @@ def get_trappist1_system() -> List[Dict[str, Any]]:
             }
         )
 
-    # Numbers below are approximate and grouped as:
-    # - Measured / well-constrained: mass, radius, orbital period (within literature ranges)
-    # - Visually scaled for sandbox: semi_major_axis values are expanded so planets are
-    #   less bunched up in the UI, while preserving their relative ordering. They are then
-    #   multiplied by TRAPPIST_ORBIT_VISUAL_SPREAD so discs do not overlap on screen.
+    # Orbital semi-major axes below are NASA archive values (AU). Visual orbit spread
+    # when inner planets would overlap the host star is handled uniformly in the UI
+    # via per-host _orbit_visual_scale (same law for every preset).
 
     # TRAPPIST-1 b – hot inner world
     add_planet(
         name="TRAPPIST-1 b",
-        semi_major_axis_au=0.11,   # visually scaled from ~0.0115 AU
+        semi_major_axis_au=0.0111,
         mass_earth=1.37,
         radius_earth=1.12,
         equilibrium_temperature_k=400.0,
@@ -425,7 +419,7 @@ def get_trappist1_system() -> List[Dict[str, Any]]:
     # TRAPPIST-1 c
     add_planet(
         name="TRAPPIST-1 c",
-        semi_major_axis_au=0.15,   # visually scaled from ~0.0158 AU
+        semi_major_axis_au=0.0152,
         mass_earth=1.31,
         radius_earth=1.10,
         equilibrium_temperature_k=342.0,
@@ -439,7 +433,7 @@ def get_trappist1_system() -> List[Dict[str, Any]]:
     # TRAPPIST-1 d
     add_planet(
         name="TRAPPIST-1 d",
-        semi_major_axis_au=0.21,   # visually scaled from ~0.0223 AU
+        semi_major_axis_au=0.0211,
         mass_earth=0.39,
         radius_earth=0.78,
         equilibrium_temperature_k=288.0,
@@ -453,7 +447,7 @@ def get_trappist1_system() -> List[Dict[str, Any]]:
     # TRAPPIST-1 e – near the classical habitable zone
     add_planet(
         name="TRAPPIST-1 e",
-        semi_major_axis_au=0.28,   # visually scaled from ~0.0292 AU
+        semi_major_axis_au=0.0282,
         mass_earth=0.69,
         radius_earth=0.92,
         equilibrium_temperature_k=251.0,
@@ -467,7 +461,7 @@ def get_trappist1_system() -> List[Dict[str, Any]]:
     # TRAPPIST-1 f
     add_planet(
         name="TRAPPIST-1 f",
-        semi_major_axis_au=0.37,   # visually scaled from ~0.0385 AU
+        semi_major_axis_au=0.0371,
         mass_earth=1.04,
         radius_earth=1.05,
         equilibrium_temperature_k=219.0,
@@ -481,7 +475,7 @@ def get_trappist1_system() -> List[Dict[str, Any]]:
     # TRAPPIST-1 g
     add_planet(
         name="TRAPPIST-1 g",
-        semi_major_axis_au=0.45,   # visually scaled from ~0.0469 AU
+        semi_major_axis_au=0.0451,
         mass_earth=1.34,
         radius_earth=1.15,
         equilibrium_temperature_k=198.0,
@@ -495,7 +489,7 @@ def get_trappist1_system() -> List[Dict[str, Any]]:
     # TRAPPIST-1 h – outermost, low flux
     add_planet(
         name="TRAPPIST-1 h",
-        semi_major_axis_au=0.60,   # visually scaled from ~0.0619 AU
+        semi_major_axis_au=0.0619,
         mass_earth=0.77,
         radius_earth=0.77,
         equilibrium_temperature_k=173.0,
@@ -504,6 +498,136 @@ def get_trappist1_system() -> List[Dict[str, Any]]:
         greenhouse_offset_k=30.0,
         classification="Icy / outer rocky",
         atmosphere_type="Thin or tenuous",
+    )
+
+    return bodies
+
+
+def get_kepler62_system() -> List[Dict[str, Any]]:
+    """
+    Kepler-62 five-planet system (NASA Exoplanet Archive, default_flag=1 rows).
+
+    Stellar parameters (K2 V host):
+    - T_eff = 4925 K, M = 0.69 M_sun, R = 0.64 R_sun, [Fe/H] = -0.37, age ~7 Gyr
+    - Luminosity from archive log10(L/L_sun) = -0.678 → ~0.21 L_sun
+
+    Planet orbital/archival values (period, semi-major axis, radius, mass, T_eq)
+    are taken from the consolidated default solutions. Stellar flux is computed as
+    L / a² in Earth insolation units. Greenhouse offsets and atmosphere labels
+    are illustrative (surface temperatures are not directly observed).
+    """
+    bodies: List[Dict[str, Any]] = []
+
+    # log10(L/L_sun) = -0.678 from NASA Exoplanet Archive stellar_hosts
+    luminosity = 10.0 ** (-0.678)
+
+    bodies.append(
+        {
+            "type": "star",
+            "name": "Kepler-62",
+            "mass": 0.69,
+            "radius": 0.64,
+            "temperature": 4925.0,
+            "luminosity": luminosity,
+            "age": 7.0,
+            "metallicity": -0.37,
+            "spectral_class": "K2V",
+            "activity": "Quiet",
+        }
+    )
+
+    def add_planet(
+        name: str,
+        semi_major_axis_au: float,
+        mass_earth: float,
+        radius_earth: float,
+        equilibrium_temperature_k: float,
+        orbital_period_days: float,
+        greenhouse_offset_k: float,
+        classification: str,
+        atmosphere_type: str,
+        eccentricity: float = 0.0,
+    ) -> None:
+        stellar_flux_se = luminosity / (semi_major_axis_au ** 2)
+        bodies.append(
+            {
+                "type": "planet",
+                "name": name,
+                "host_star": "Kepler-62",
+                "preset_type": name,
+                "classification": classification,
+                "mass": mass_earth,
+                "radius": radius_earth,
+                "semi_major_axis": semi_major_axis_au,
+                "orbital_period": orbital_period_days,
+                "eccentricity": eccentricity,
+                "stellarFlux": stellar_flux_se,
+                "equilibrium_temperature": equilibrium_temperature_k,
+                "greenhouse_offset": greenhouse_offset_k,
+                "temperature": equilibrium_temperature_k + greenhouse_offset_k,
+                "rotation_period_days": orbital_period_days,
+                "atmosphere_type": atmosphere_type,
+            }
+        )
+
+    add_planet(
+        name="Kepler-62 b",
+        semi_major_axis_au=0.0553,
+        mass_earth=9.0,
+        radius_earth=1.31,
+        equilibrium_temperature_k=750.0,
+        orbital_period_days=5.715,
+        greenhouse_offset_k=40.0,
+        classification="Hot super-Earth",
+        atmosphere_type="Very thick, hot",
+    )
+
+    add_planet(
+        name="Kepler-62 c",
+        semi_major_axis_au=0.0929,
+        mass_earth=4.0,
+        radius_earth=0.54,
+        equilibrium_temperature_k=578.0,
+        orbital_period_days=12.442,
+        greenhouse_offset_k=25.0,
+        classification="Rocky / sub-Neptune",
+        atmosphere_type="Thick, hot",
+    )
+
+    add_planet(
+        name="Kepler-62 d",
+        semi_major_axis_au=0.120,
+        mass_earth=14.0,
+        radius_earth=1.95,
+        equilibrium_temperature_k=510.0,
+        orbital_period_days=18.164,
+        greenhouse_offset_k=20.0,
+        classification="Warm super-Earth",
+        atmosphere_type="Thick, warm",
+    )
+
+    add_planet(
+        name="Kepler-62 e",
+        semi_major_axis_au=0.427,
+        mass_earth=36.0,
+        radius_earth=1.61,
+        equilibrium_temperature_k=270.0,
+        orbital_period_days=122.387,
+        greenhouse_offset_k=33.0,
+        classification="Habitable-zone super-Earth",
+        atmosphere_type="Temperate, possible surface water",
+    )
+
+    add_planet(
+        name="Kepler-62 f",
+        semi_major_axis_au=0.718,
+        mass_earth=35.0,
+        radius_earth=1.41,
+        equilibrium_temperature_k=208.0,
+        orbital_period_days=267.291,
+        greenhouse_offset_k=25.0,
+        classification="Cold habitable-zone super-Earth",
+        atmosphere_type="Thick, cold",
     )
 
     return bodies

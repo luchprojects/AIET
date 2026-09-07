@@ -15,17 +15,14 @@ import textwrap
 from datetime import datetime
 from typing import List, Tuple, Dict, Any, Optional
 from uuid import uuid4
-try:
-    from src.physics.simulation_engine import CelestialBody, SimulationEngine
-except ImportError:
-    from src.simulation_engine import CelestialBody, SimulationEngine
+from src.simulation_engine import CelestialBody, SimulationEngine
 from src.physics.system_presets import (
     get_blank_system,
     get_earth_moon_sun_system,
     get_solar_system,
     get_alpha_centauri_system,
     get_trappist1_system,
-    TRAPPIST_ORBIT_VISUAL_SPREAD,
+    get_kepler62_system,
 )
 try:
     import matplotlib
@@ -50,6 +47,20 @@ except ImportError:
     DIAGNOSTICS_PANEL_AVAILABLE = False
 
 from src.ui.camera_control import Camera
+from src.ui import theme as ui_theme
+try:
+    from src.ui.star_data_panel import StarDataPanel
+    STAR_DATA_PANEL_AVAILABLE = True
+except ImportError:
+    StarDataPanel = None
+    STAR_DATA_PANEL_AVAILABLE = False
+try:
+    from src.ui.detection_panel import DetectionPanel
+    DETECTION_PANEL_AVAILABLE = True
+except ImportError:
+    DetectionPanel = None
+    DETECTION_PANEL_AVAILABLE = False
+from src.ui.theme import THEME, TYPE_SCALE, apply_theme, load_type_kit, make_inter_font, resolve_inter_path
 from src.ui import renderer_utils as _renderer_utils
 try:
     from src.persistence_manager import (
@@ -69,7 +80,7 @@ except ImportError:
 # ============================================================================
 # VERSION (for export provenance)
 # ============================================================================
-AIET_VERSION = "1.0"
+AIET_VERSION = "2.0"
 # Orbit layout export (menu label + filename; replaces generic "screenshot")
 ORBIT_SNAPSHOT_MENU_LABEL = "Orbit Snapshot"
 ORBIT_SNAPSHOT_FILENAME = "orbit_snapshot.png"
@@ -228,16 +239,13 @@ STAR_HUGE_STAR_THRESHOLD = 200.0  # Solar radii - stars above this can use more 
 STAR_CLAMP_SAFE_RATIO = 0.25  # Star can occupy up to 25% of closest orbit before clamping engages (prevents normal stars from shrinking when inner planets are added)
 STAR_SMALL_STAR_EXEMPTION = 5.0  # Stars <= 5.0 R☉ skip clamping entirely (Sun-like stars never need orbit-based clamping)
 
-# Alpha Centauri triple: stars must read clearly larger than planets at every zoom level.
-# The generic small-star alternate-radius path inflates M/K dwarfs to planet-scale disks;
-# these overrides apply only when _current_preset == "alpha_centauri".
-AC_STAR_RADIUS_FLOOR_GK = 32.0    # Alpha Centauri A & B (G2V / K1V)
-AC_STAR_RADIUS_FLOOR_M = 22.0     # Proxima Centauri (M5.5V; still a star, not a planet dot)
-AC_PLANET_MAX_VS_STAR = 0.25      # planets never exceed 25% of host star visual radius
-AC_PLANET_MAX_PX_ROCKY = 12.0     # rocky / super-Earth absolute cap (px, pre-zoom)
-AC_PLANET_MAX_PX_GIANT = 18.0     # gas-giant absolute cap (px, pre-zoom)
-AC_SCREEN_STAR_MIN_PX = 5         # minimum on-screen star radius when zoomed out
-AC_SCREEN_PLANET_MAX_FRAC = 0.35  # on-screen planet <= 35% of host star on-screen radius
+# Unified visual scaling (all presets use the same perceptual laws)
+PLANET_MAX_VS_STAR = 0.35       # planets never exceed 35% of host star disk radius
+PLANET_MAX_PX_ROCKY = 14.0      # super-Earth / rocky absolute cap (px, pre-zoom)
+PLANET_MAX_PX_GIANT = 20.0      # gas-giant absolute cap (px, pre-zoom)
+ORBIT_CLEARANCE_GAP_PX = 4.0    # gap between host star edge and innermost orbit ring
+SCREEN_STAR_MIN_PX = 5          # minimum on-screen star radius when zoomed out
+SCREEN_PLANET_MAX_FRAC = 0.35   # on-screen planet <= 35% of host star on-screen radius
 
 # Physical constants for engulfment detection
 RSUN_TO_AU = 0.00465047  # Solar radius in AU (for physical engulfment check)
@@ -423,8 +431,17 @@ class SolarSystemVisualizer:
             self._clipboard_available = False
         self.width = width
         self.height = height
-        self.screen = pygame.display.set_mode((width, height))
-        pygame.display.set_caption("AIET - Solar System Simulator")
+        # Fixed logical resolution — UI/sim layout always uses width×height.
+        # The OS window can resize/fullscreen; we letterbox-scale to preserve proportions.
+        self._min_display_width = 800
+        self._min_display_height = 600
+        self._windowed_size = (width, height)
+        self._is_fullscreen = False
+        self.screen = pygame.Surface((width, height))
+        self._display = pygame.display.set_mode(self._windowed_size, pygame.RESIZABLE)
+        self._viewport = pygame.Rect(0, 0, width, height)
+        self._update_viewport()
+        pygame.display.set_caption("AIET  ·  F11 fullscreen  ·  resizable")
         self.clock = pygame.time.Clock()
         self.scale = AU_TO_PX  # pixels per AU
         self.center = np.array([width/2, height/2])
@@ -458,88 +475,25 @@ class SolarSystemVisualizer:
             'EFU': 'EFU'
         }
         
-        inter_font_path = None
-        try:
-            from src.utils.paths import font_path
-            local_font_path = font_path("Inter-Regular.ttf")
-            if os.path.exists(local_font_path):
-                inter_font_path = local_font_path
-        except Exception:
-            pass
-        if inter_font_path is None:
-            # Try to find Inter font in system using match_font
-            try:
-                inter_font_path = pygame.font.match_font('Inter')
-                if not inter_font_path:
-                    # Try alternative names
-                    for name in ['Inter Regular', 'inter', 'Inter-Regular', 'InterRegular']:
-                        inter_font_path = pygame.font.match_font(name)
-                        if inter_font_path:
-                            break
-            except:
-                pass
-        
-        # Use Inter if found, otherwise fallback to default
-        if inter_font_path:
-            try:
-                self.font = pygame.font.Font(inter_font_path, 28)  # Reduced from 36
-                self.title_font = pygame.font.Font(inter_font_path, 54)  # Reduced from 72
-                self.home_title_font = pygame.font.Font(inter_font_path, 80)  # Large title for start screen
-                self.subtitle_font = pygame.font.Font(inter_font_path, 18)  # Reduced from 24
-                self.tiny_font = pygame.font.Font(inter_font_path, 14)  # Reduced from 18
-                self.micro_font = pygame.font.Font(inter_font_path, 11)  # Smaller for long menu labels
-                self.tab_font = pygame.font.Font(inter_font_path, 16)  # Reduced from 20
-                self.button_font = pygame.font.Font(inter_font_path, 28)  # Reduced from 36
-                self.home_disclaimer_font = pygame.font.Font(inter_font_path, 16)  # Start screen disclaimer only
-            except Exception as e:
-                print(f"Warning: Could not load Inter font from path ({e}), using default font.")
-                self.font = pygame.font.Font(None, 28)
-                self.title_font = pygame.font.Font(None, 54)
-                self.home_title_font = pygame.font.Font(None, 80)
-                self.subtitle_font = pygame.font.Font(None, 18)
-                self.tiny_font = pygame.font.Font(None, 14)
-                self.micro_font = pygame.font.Font(None, 11)
-                self.tab_font = pygame.font.Font(None, 16)
-                self.button_font = pygame.font.Font(None, 28)
-                self.home_disclaimer_font = pygame.font.Font(None, 16)
-        else:
-            # Try SysFont as fallback before default
-            try:
-                self.font = pygame.font.SysFont('Inter', 28)
-                self.title_font = pygame.font.SysFont('Inter', 54)
-                self.home_title_font = pygame.font.SysFont('Inter', 80)
-                self.subtitle_font = pygame.font.SysFont('Inter', 18)
-                self.tiny_font = pygame.font.SysFont('Inter', 14)
-                self.micro_font = pygame.font.SysFont('Inter', 11)
-                self.tab_font = pygame.font.SysFont('Inter', 16)
-                self.button_font = pygame.font.SysFont('Inter', 28)
-                self.home_disclaimer_font = pygame.font.SysFont('Inter', 16)
-            except:
-                # Final fallback to default font
-                print("Warning: Inter font not found, using default font. Install Inter font for best experience.")
-                self.font = pygame.font.Font(None, 28)
-                self.title_font = pygame.font.Font(None, 54)
-                self.home_title_font = pygame.font.Font(None, 80)
-                self.subtitle_font = pygame.font.Font(None, 18)
-                self.tiny_font = pygame.font.Font(None, 14)
-                self.micro_font = pygame.font.Font(None, 11)
-                self.tab_font = pygame.font.Font(None, 16)
-                self.button_font = pygame.font.Font(None, 28)
-                self.home_disclaimer_font = pygame.font.Font(None, 16)
-        
-        try:
-            from src.utils.paths import font_path
-            local_bold_path = font_path("Inter-Bold.ttf")
-        except Exception:
-            local_bold_path = None
-        if local_bold_path and os.path.exists(local_bold_path):
-            try:
-                self.home_title_bold_font = pygame.font.Font(local_bold_path, 80)
-            except Exception:
-                self.home_title_bold_font = self.home_title_font
-        else:
-            self.home_title_bold_font = self.home_title_font
-        
+        # Type scale (see src/ui/theme.py TYPE_SCALE / TYPE_WEIGHTS). Sizes stay
+        # exact so hit-testing rects remain valid; weights use real Inter files.
+        from src.utils.paths import font_path as _font_path
+        kit = load_type_kit(_font_path)
+        self.home_title_font = make_inter_font(TYPE_SCALE["display"], "regular", font_path_fn=_font_path)
+        self.title_font = kit["h1"]
+        self.font = kit["h2"]
+        self.button_font = self.font
+        self.subtitle_font = kit["body"]
+        self.headline_font = make_inter_font(TYPE_SCALE["body"], "semibold", font_path_fn=_font_path)
+        self.tab_font = kit["label"]
+        # Home screen is the restored v1 look: keep its disclaimer on Regular.
+        self.home_disclaimer_font = make_inter_font(TYPE_SCALE["label"], "regular", font_path_fn=_font_path)
+        self.tiny_font = kit["small"]
+        self.micro_font = kit["caption"]
+        self.home_title_bold_font = make_inter_font(TYPE_SCALE["display"], "bold", font_path_fn=_font_path)
+        if not resolve_inter_path("regular", _font_path):
+            print("Warning: Inter font not found, using system/default font. Install Inter font for best experience.")
+ 
         # Screen states
         # Start on the home screen (startup menu); enter sandbox after user clicks "Create"
         self.show_home_screen = True
@@ -577,6 +531,9 @@ class SolarSystemVisualizer:
         self.UI_PANEL_BORDER = (70, 80, 95)
         self.GRID_COLOR = (30, 30, 50)
         self.ACTIVE_TAB_COLOR = (255, 100, 100)  # Bright red for active tab
+        # Theme tokens override the legacy palette above (paint only; no geometry).
+        apply_theme(self, THEME)
+        self.theme = THEME
         
         # Home screen state
         self.ambient_colors = [(119, 236, 57)]  # Green color
@@ -624,7 +581,7 @@ class SolarSystemVisualizer:
         # Add Body -> Planets hierarchical menus (UI-only)
         self.planets_family_dropdown_visible = False
         self.planets_family_dropdown_rect = None
-        self.planets_family_options = ["Solar System", "TRAPPIST-1", "Alpha Centauri"]
+        self.planets_family_options = ["Solar System", "TRAPPIST-1", "Kepler-62", "Alpha Centauri"]
         self.planets_family_selected: Optional[str] = None
         self.planets_list_dropdown_visible = False
         self.planets_list_dropdown_rect = None
@@ -632,15 +589,23 @@ class SolarSystemVisualizer:
         # to use during placement (so we don't require SOLAR_SYSTEM_PLANET_PRESETS lookup).
         self.planet_preset_pending_dict: Optional[dict] = None
 
-        _ts = TRAPPIST_ORBIT_VISUAL_SPREAD
+        _ts = 1.0  # orbit distances use physical AU; visual spread is computed per host star
         self.trappist1_planet_presets = {
-            "TRAPPIST-1 b": {"mass": 1.37, "radius": 1.12, "semiMajorAxis": 0.11 * _ts, "temperature": 450.0, "base_color": "#2B2B2B"},
-            "TRAPPIST-1 c": {"mass": 1.31, "radius": 1.10, "semiMajorAxis": 0.15 * _ts, "temperature": 382.0, "base_color": "#EADFA6"},
-            "TRAPPIST-1 d": {"mass": 0.39, "radius": 0.78, "semiMajorAxis": 0.21 * _ts, "temperature": 313.0, "base_color": "#B5522D"},
-            "TRAPPIST-1 e": {"mass": 0.69, "radius": 0.92, "semiMajorAxis": 0.28 * _ts, "temperature": 286.0, "base_color": "#1B5E4B"},
-            "TRAPPIST-1 f": {"mass": 1.04, "radius": 1.05, "semiMajorAxis": 0.37 * _ts, "temperature": 259.0, "base_color": "#8FA9C5"},
-            "TRAPPIST-1 g": {"mass": 1.34, "radius": 1.15, "semiMajorAxis": 0.45 * _ts, "temperature": 233.0, "base_color": "#EAF6FF"},
-            "TRAPPIST-1 h": {"mass": 0.77, "radius": 0.77, "semiMajorAxis": 0.60 * _ts, "temperature": 203.0, "base_color": "#D9D9D1"},
+            "TRAPPIST-1 b": {"mass": 1.37, "radius": 1.12, "semiMajorAxis": 0.0111 * _ts, "temperature": 450.0, "base_color": "#2B2B2B"},
+            "TRAPPIST-1 c": {"mass": 1.31, "radius": 1.10, "semiMajorAxis": 0.0152 * _ts, "temperature": 382.0, "base_color": "#EADFA6"},
+            "TRAPPIST-1 d": {"mass": 0.39, "radius": 0.78, "semiMajorAxis": 0.0211 * _ts, "temperature": 313.0, "base_color": "#B5522D"},
+            "TRAPPIST-1 e": {"mass": 0.69, "radius": 0.92, "semiMajorAxis": 0.0282 * _ts, "temperature": 286.0, "base_color": "#1B5E4B"},
+            "TRAPPIST-1 f": {"mass": 1.04, "radius": 1.05, "semiMajorAxis": 0.0371 * _ts, "temperature": 259.0, "base_color": "#8FA9C5"},
+            "TRAPPIST-1 g": {"mass": 1.34, "radius": 1.15, "semiMajorAxis": 0.0451 * _ts, "temperature": 233.0, "base_color": "#EAF6FF"},
+            "TRAPPIST-1 h": {"mass": 0.77, "radius": 0.77, "semiMajorAxis": 0.0619 * _ts, "temperature": 203.0, "base_color": "#D9D9D1"},
+        }
+
+        self.kepler62_planet_presets = {
+            "Kepler-62 b": {"mass": 9.0, "radius": 1.31, "semiMajorAxis": 0.0553, "temperature": 790.0, "base_color": "#3D1F14"},
+            "Kepler-62 c": {"mass": 4.0, "radius": 0.54, "semiMajorAxis": 0.0929, "temperature": 603.0, "base_color": "#C4A882"},
+            "Kepler-62 d": {"mass": 14.0, "radius": 1.95, "semiMajorAxis": 0.120, "temperature": 530.0, "base_color": "#B85C38"},
+            "Kepler-62 e": {"mass": 36.0, "radius": 1.61, "semiMajorAxis": 0.427, "temperature": 303.0, "base_color": "#2D6A5A"},
+            "Kepler-62 f": {"mass": 35.0, "radius": 1.41, "semiMajorAxis": 0.718, "temperature": 233.0, "base_color": "#7EB8D4"},
         }
 
         # Alpha Centauri planet presets (from physics system preset; simplified for placement)
@@ -654,7 +619,7 @@ class SolarSystemVisualizer:
         # Add Body -> Stars hierarchical menus (UI-only)
         self.stars_family_dropdown_visible = False
         self.stars_family_dropdown_rect = None
-        self.stars_family_options = ["Sun", "TRAPPIST-1", "Alpha Centauri"]
+        self.stars_family_options = ["Sun", "TRAPPIST-1", "Kepler-62", "Alpha Centauri"]
         self.stars_family_selected: Optional[str] = None
         self.stars_list_dropdown_visible = False
         self.stars_list_dropdown_rect = None
@@ -687,6 +652,17 @@ class SolarSystemVisualizer:
                 "activity": "Active",
                 "spectral_class": "M8V",
                 "base_color": "#FF9B6A",
+            },
+            "Kepler-62": {
+                "mass": 0.69,
+                "radius": 0.64,
+                "temperature": 4925.0,
+                "luminosity": 10.0 ** (-0.678),
+                "age": 7.0,
+                "metallicity": -0.37,
+                "activity": "Quiet",
+                "spectral_class": "K2V",
+                "base_color": "#FFB84D",
             },
             "Alpha Centauri A": {
                 "mass": 1.10,
@@ -779,6 +755,28 @@ class SolarSystemVisualizer:
                 self.diagnostics_panel = None
         else:
             self.diagnostics_panel = None
+
+        # Star Data panel (spectrum / H-R / evolution / HZ over time / properties for the selected star)
+        self.star_data_panel = None
+        self.star_data_tab_button_rects = {}
+        if STAR_DATA_PANEL_AVAILABLE and StarDataPanel:
+            try:
+                self.star_data_panel = StarDataPanel(self)
+                print("[UI] Star Data Panel initialized")
+            except Exception as e:
+                print(f"Warning: Could not initialize Star Data Panel: {e}")
+                self.star_data_panel = None
+
+        # Detection panel (radial velocity / transit / method comparison for the selected planet)
+        self.detection_panel = None
+        self.detection_tab_button_rects = {}
+        if DETECTION_PANEL_AVAILABLE and DetectionPanel:
+            try:
+                self.detection_panel = DetectionPanel(self)
+                print("[UI] Detection Panel initialized")
+            except Exception as e:
+                print(f"Warning: Could not initialize Detection Panel: {e}")
+                self.detection_panel = None
         
         self.body_counter = {"moon": 0, "planet": 0, "star": 0}
         
@@ -842,6 +840,7 @@ class SolarSystemVisualizer:
             "Earth–Moon–Sun",
             "Solar System",
             "TRAPPIST-1",
+            "Kepler-62",
             "Alpha Centauri",
             "Import System Seed",
             "Custom",
@@ -1270,10 +1269,10 @@ class SolarSystemVisualizer:
         self.dropdown_surface = None
         self.dropdown_rect = None
         self.dropdown_options_rects = []
-        self.dropdown_background_color = self.UI_PANEL_BG  # Match customization panel dark blue
-        self.dropdown_border_color = (60, 70, 90)  # Subtle border on dark background
-        self.dropdown_hover_color = (55, 65, 85)  # Slightly lighter for hover
-        self.dropdown_text_color = self.UI_PANEL_TEXT  # Light text (matches other dropdowns)
+        self.dropdown_background_color = THEME.panel_elevated  # Field/dropdown surface
+        self.dropdown_border_color = THEME.panel_border
+        self.dropdown_hover_color = THEME.hover
+        self.dropdown_text_color = THEME.text_primary
         self.dropdown_padding = 5  # Padding around text
         self.dropdown_option_height = 30  # Height of each option
         self.dropdown_border_width = 1  # Width of option borders
@@ -1922,8 +1921,8 @@ class SolarSystemVisualizer:
         if center is None:
             return
         cx, cy = int(center[0]), int(center[1])
-        line_w = max(1, int(2 * self.camera.zoom))
-        ring_color = (160, 155, 130)  # warm gray, matches existing star-trail color
+        line_w = max(1, int(1.5 * self.camera.zoom))
+        ring_color = self.theme.star_trail  # warm gray, matches star-trail color
         for body in self.placed_bodies:
             if body.get("is_destroyed", False) or body.get("type") != "star":
                 continue
@@ -2161,7 +2160,8 @@ class SolarSystemVisualizer:
         """Draw the Time Control HUD (above scale indicator, compact, low-opacity)."""
         layout = self._get_time_controls_layout()
         panel_rect = layout["panel_rect"]
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self._mouse_pos()
+        theme = self.theme
         
         # 0. Focus hint: "Following: Earth" when camera is following a body
         if self.camera.camera_focus.get("active") and self.camera.camera_focus.get("target_body_id"):
@@ -2169,69 +2169,62 @@ class SolarSystemVisualizer:
             body = self.bodies_by_id.get(tid)
             if body:
                 name = body.get("display_name", body.get("name", "?"))
-                follow_surf = self.tiny_font.render(f"Following: {name}", True, (160, 200, 240))
+                follow_surf = self.tiny_font.render(f"Following: {name}", True, theme.accent_soft)
                 follow_x = panel_rect.left
                 follow_y = panel_rect.top - follow_surf.get_height() - 4
                 if follow_y >= 0:
                     surface.blit(follow_surf, (follow_x, follow_y))
         
-        # 1. Draw Box Background (85% opacity, thin border)
-        bg_surface = pygame.Surface(panel_rect.size, pygame.SRCALPHA)
-        bg_surface.fill((20, 25, 35, 216))  # Dark blue-gray, 85% opacity
-        surface.blit(bg_surface, panel_rect.topleft)
-        pygame.draw.rect(surface, (60, 70, 90), panel_rect, 1, border_radius=4)
+        # 1. HUD card
+        ui_theme.draw_hud_panel(surface, panel_rect, theme)
         
-        # 2. Draw Speed and Clock (readability: labels + spacing + clock primary)
+        # 2. Speed and clock: label muted, clock primary
         pad_left = 10
         row1_y = panel_rect.top + 6
-        row2_y = panel_rect.top + 24   # extra gap so clock line stands out
-        label_color = (150, 155, 170)  # muted for "Speed:" / "Sim:"
-        speed_value_color = (255, 220, 100)
-        clock_value_color = (235, 240, 250)  # brighter so clock is primary
+        row2_y = panel_rect.top + 24
 
         scales = self._active_time_scales()
         active_scale = scales[self.current_scale_index] if not self.paused else 0.0
         speed_mapping = self._format_time_scale(active_scale)
-        speed_label = self.tiny_font.render("Speed: ", True, label_color)
-        speed_value = self.tiny_font.render(speed_mapping, True, speed_value_color)
+        speed_label = self.tiny_font.render("Speed ", True, theme.text_tertiary)
+        speed_value = self.tiny_font.render(speed_mapping, True, theme.hud_speed_text if not self.paused else theme.text_secondary)
         surface.blit(speed_label, (panel_rect.left + pad_left, row1_y))
         surface.blit(speed_value, (panel_rect.left + pad_left + speed_label.get_width(), row1_y))
 
         elapsed_str = self._format_elapsed_time(self.simulation_time_seconds)
-        clock_text = self.tiny_font.render(elapsed_str, True, clock_value_color)
+        clock_text = self.tiny_font.render(elapsed_str, True, theme.text_primary)
         surface.blit(clock_text, (panel_rect.left + pad_left, row2_y))
 
-        # 3. Draw Controls: ⏪ ⏸/▶ ⏩ (compact, flat style)
-        # Decel (⏪)
+        # 3. Transport controls: drawn glyphs instead of text so weights match
+        def _glyph_color(hover: bool) -> Tuple[int, int, int]:
+            return theme.text_primary if hover else theme.text_secondary
+
         d_rect = layout["decel_rect"]
         d_hover = d_rect.collidepoint(mouse_pos)
-        d_color = (55, 65, 85) if d_hover else (40, 48, 65)
-        pygame.draw.rect(surface, d_color, d_rect, border_radius=3)
-        pygame.draw.rect(surface, (70, 80, 100), d_rect, 1, border_radius=3)
-        d_label = self.tiny_font.render("<<", True, (180, 185, 195))
-        surface.blit(d_label, d_label.get_rect(center=d_rect.center))
+        ui_theme.draw_toolbar_button(surface, d_rect, hover=d_hover, theme=theme)
+        gc = _glyph_color(d_hover)
+        cx, cy = d_rect.center
+        pygame.draw.polygon(surface, gc, [(cx + 1, cy - 4), (cx + 1, cy + 4), (cx - 4, cy)])
+        pygame.draw.polygon(surface, gc, [(cx + 6, cy - 4), (cx + 6, cy + 4), (cx + 1, cy)])
         
-        # Pause/Play (⏸ / ▶)
         p_rect = layout["pause_play_rect"]
         p_hover = p_rect.collidepoint(mouse_pos)
+        ui_theme.draw_toolbar_button(surface, p_rect, hover=p_hover, active=self.paused, theme=theme)
+        gc = theme.accent_soft if self.paused else _glyph_color(p_hover)
+        cx, cy = p_rect.center
         if self.paused:
-            p_color = (60, 90, 70) if p_hover else (50, 80, 60)  # Greenish when paused
+            pygame.draw.polygon(surface, gc, [(cx - 3, cy - 5), (cx - 3, cy + 5), (cx + 5, cy)])
         else:
-            p_color = (55, 65, 85) if p_hover else (40, 48, 65)
-        pygame.draw.rect(surface, p_color, p_rect, border_radius=3)
-        pygame.draw.rect(surface, (70, 80, 100), p_rect, 1, border_radius=3)
-        p_label_str = ">" if self.paused else "||"
-        p_label = self.tiny_font.render(p_label_str, True, (180, 185, 195))
-        surface.blit(p_label, p_label.get_rect(center=p_rect.center))
+            pygame.draw.rect(surface, gc, pygame.Rect(cx - 5, cy - 5, 3, 10))
+            pygame.draw.rect(surface, gc, pygame.Rect(cx + 2, cy - 5, 3, 10))
         
-        # Accel (⏩)
         a_rect = layout["accel_rect"]
         a_hover = a_rect.collidepoint(mouse_pos)
-        a_color = (55, 65, 85) if a_hover else (40, 48, 65)
-        pygame.draw.rect(surface, a_color, a_rect, border_radius=3)
-        pygame.draw.rect(surface, (70, 80, 100), a_rect, 1, border_radius=3)
-        a_label = self.tiny_font.render(">>", True, (180, 185, 195))
-        surface.blit(a_label, a_label.get_rect(center=a_rect.center))
+        ui_theme.draw_toolbar_button(surface, a_rect, hover=a_hover, theme=theme)
+        gc = _glyph_color(a_hover)
+        cx, cy = a_rect.center
+        pygame.draw.polygon(surface, gc, [(cx - 6, cy - 4), (cx - 6, cy + 4), (cx - 1, cy)])
+        pygame.draw.polygon(surface, gc, [(cx - 1, cy - 4), (cx - 1, cy + 4), (cx + 4, cy)])
         
         # N-Body precision tooltip when time_scale is very high
         if getattr(self, "physics_mode", "keplerian") == "nbody" and getattr(self, "time_scale", 0) > 1e5:
@@ -2248,34 +2241,33 @@ class SolarSystemVisualizer:
         panel_rect = layout.get("panel_rect")
         if not panel_rect:
             return
+        theme = self.theme
         # Show last 2 messages, above the time panel (most recent nearest panel)
         shown = list(reversed(msgs[-2:]))
         for i, text in enumerate(shown):
-            surf = self.tiny_font.render(text, True, (240, 180, 180))
-            y = panel_rect.top - (len(shown) - i) * (surf.get_height() + 4) - 6
+            surf = self.tiny_font.render(text, True, theme.text_primary)
+            box_h = surf.get_height() + theme.space_sm
+            y = panel_rect.top - (len(shown) - i) * (box_h + 4) - 6
             if y < 0:
                 continue
-            bg = pygame.Surface((surf.get_width() + 16, surf.get_height() + 6), pygame.SRCALPHA)
-            bg.fill((40, 20, 20, 200))
-            self.screen.blit(bg, (panel_rect.left, y))
-            self.screen.blit(surf, (panel_rect.left + 8, y + 3))
+            rect = pygame.Rect(panel_rect.left, y, surf.get_width() + theme.space_lg + theme.space_sm, box_h)
+            ui_theme.draw_toast(self.screen, rect, tone="danger", theme=theme)
+            self.screen.blit(surf, (rect.left + theme.space_md, rect.top + theme.space_xs))
     
     def draw_export_toast(self):
         """Draw 'Exported to [path]' message for a few seconds after export."""
         if not self.export_toast_message or time.time() > self.export_toast_until:
             return
-        pad = 12
-        msg_surf = self.tiny_font.render(self.export_toast_message, True, (240, 240, 240))
-        box_w = msg_surf.get_width() + pad * 2
+        theme = self.theme
+        pad = theme.space_md
+        msg_surf = self.tiny_font.render(self.export_toast_message, True, theme.text_primary)
+        box_w = msg_surf.get_width() + pad * 2 + theme.space_xs
         box_h = msg_surf.get_height() + pad
         box_x = (self.width - box_w) // 2
         box_y = self.height - 80 - box_h
         toast_rect = pygame.Rect(box_x, box_y, box_w, box_h)
-        toast_surf = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
-        toast_surf.fill((30, 35, 45, 230))
-        self.screen.blit(toast_surf, toast_rect.topleft)
-        pygame.draw.rect(self.screen, (80, 100, 130), toast_rect, 1, border_radius=4)
-        self.screen.blit(msg_surf, (toast_rect.left + pad, toast_rect.top + pad // 2))
+        ui_theme.draw_toast(self.screen, toast_rect, tone="neutral", theme=theme)
+        self.screen.blit(msg_surf, (toast_rect.left + pad + theme.space_xs, toast_rect.top + pad // 2))
     
     def draw_reset_button(self):
         """Legacy method - Reset View is now in the Reset dropdown."""
@@ -2287,25 +2279,15 @@ class SolarSystemVisualizer:
     
     def draw_about_button(self):
         """Draw the About / Methods button (info icon) in screen space with flat styling."""
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self._mouse_pos()
         is_hovering = self.about_button.collidepoint(mouse_pos)
-        
-        # Flat button colors (no transparency)
-        if is_hovering:
-            bg_color = (65, 75, 90)
-        else:
-            bg_color = (50, 60, 75)
-        
-        # Draw button background (flat, no transparency)
-        pygame.draw.rect(self.screen, bg_color, self.about_button, border_radius=4)
-        
-        # Draw subtle border
-        pygame.draw.rect(self.screen, (80, 90, 105), self.about_button, 1, border_radius=4)
-        
-        # Draw "i" info icon
-        icon_label = self.tiny_font.render("i", True, (200, 210, 220))
-        icon_rect = icon_label.get_rect(center=self.about_button.center)
-        self.screen.blit(icon_label, icon_rect)
+        theme = self.theme
+        is_open = bool(getattr(self, "show_about_panel", False))
+        ui_theme.draw_toolbar_button(self.screen, self.about_button, hover=is_hovering, active=is_open, theme=theme)
+        ui_theme.draw_info_glyph(
+            self.screen, self.about_button.center, self.tiny_font,
+            radius=7, hover=(is_hovering or is_open), theme=theme,
+        )
     
     # Tooltip text definitions for scientific parameters
     TOOLTIP_TEXTS = {
@@ -2384,7 +2366,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             return
         
         tooltip_text = self.TOOLTIP_TEXTS[param_name]
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self._mouse_pos()
         
         # Only show tooltip if mouse is hovering over the icon
         if not anchor_rect.collidepoint(mouse_pos):
@@ -2438,17 +2420,12 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         
         tooltip_rect = pygame.Rect(tooltip_x, tooltip_y, tooltip_width, tooltip_height)
         
-        # Draw shadow
-        shadow_rect = tooltip_rect.copy()
-        shadow_rect.move_ip(3, 3)
-        shadow_surf = pygame.Surface((tooltip_width, tooltip_height), pygame.SRCALPHA)
-        shadow_surf.fill((0, 0, 0, 120))
-        self.screen.blit(shadow_surf, shadow_rect.topleft)
-        
-        # Draw tooltip background
+        # Tooltip card: shadow + translucent surface + hairline border
+        theme = self.theme
+        ui_theme.draw_shadow(self.screen, tooltip_rect, radius=theme.radius_sm, offset=3, alpha=110)
         tooltip_surf = pygame.Surface((tooltip_width, tooltip_height), pygame.SRCALPHA)
-        tooltip_surf.fill((30, 30, 40, 240))
-        pygame.draw.rect(tooltip_surf, (100, 150, 200), tooltip_surf.get_rect(), 2)
+        pygame.draw.rect(tooltip_surf, theme.tooltip_bg, tooltip_surf.get_rect(), border_radius=theme.radius_sm)
+        pygame.draw.rect(tooltip_surf, theme.tooltip_border, tooltip_surf.get_rect(), 1, border_radius=theme.radius_sm)
         self.screen.blit(tooltip_surf, tooltip_rect.topleft)
         
         # Draw text
@@ -2457,9 +2434,9 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             if line:  # Skip empty lines for spacing
                 # First line is usually the parameter name - make it bold/subtitle
                 if curr_y == padding and '\n' in tooltip_text and line == tooltip_text.split('\n')[0]:
-                    line_surf = self.subtitle_font.render(line, True, (200, 220, 255))
+                    line_surf = self.subtitle_font.render(line, True, theme.text_primary)
                 else:
-                    line_surf = self.tiny_font.render(line, True, self.WHITE)
+                    line_surf = self.tiny_font.render(line, True, theme.text_secondary)
                 self.screen.blit(line_surf, (tooltip_rect.left + padding, tooltip_rect.top + curr_y))
             curr_y += line_height
     
@@ -2536,7 +2513,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         """
         header_cx = self.width - self.customization_panel_width // 2
         header_cy = 56
-        rename_muted = (145, 150, 165)
+        rename_muted = self.theme.text_tertiary
         prefix_surf = self.subtitle_font.render("Customize ", True, self.UI_PANEL_TEXT)
         name_surf = self.subtitle_font.render(disp_name, True, self.UI_PANEL_TEXT)
         pencil_size = 15
@@ -2594,10 +2571,10 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             self.prefab_save_btn_rect = pygame.Rect(
                 int(sx), int(header_cy - save_icon_size // 2), save_icon_size, save_icon_size
             )
-            mouse = pygame.mouse.get_pos()
+            mouse = self._mouse_pos()
             if self.prefab_save_btn_rect.collidepoint(mouse):
                 pad = pygame.Rect(self.prefab_save_btn_rect).inflate(4, 4)
-                pygame.draw.rect(self.screen, (52, 56, 54), pad, border_radius=4)
+                pygame.draw.rect(self.screen, self.theme.hover, pad, border_radius=4)
             self._draw_save_to_tray_icon(self.prefab_save_btn_rect, rename_muted)
             row_rect = row_rect.union(self.prefab_save_btn_rect)
 
@@ -2622,10 +2599,11 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         icon_y = label_rect.centery - icon_size // 2
         icon_rect = pygame.Rect(icon_x, icon_y, icon_size, icon_size)
         
-        # Draw (i) icon (text-based for cross-platform compatibility)
-        icon_surf = self.tiny_font.render("(i)", True, (100, 150, 200))
-        icon_rect_centered = icon_surf.get_rect(center=icon_rect.center)
-        self.screen.blit(icon_surf, icon_rect_centered)
+        # Circled-i glyph; brightens on hover
+        hovering = icon_rect.collidepoint(self._mouse_pos())
+        ui_theme.draw_info_glyph(
+            self.screen, icon_rect.center, self.micro_font, radius=7, hover=hovering, theme=self.theme,
+        )
         
         # Store for hover detection
         self.parameter_tooltip_icons[param_name] = icon_rect
@@ -2636,62 +2614,44 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         """Draw the confirmation modal for resetting the system."""
         if not self.reset_system_confirm_modal:
             return
+        theme = self.theme
+        mouse = self._mouse_pos()
         
-        # Modal dimensions
         modal_width = 450
         modal_height = 200
         modal_rect = pygame.Rect((self.width - modal_width) // 2, (self.height - modal_height) // 2, modal_width, modal_height)
         self.reset_confirm_modal_rect = modal_rect  # Store for click detection
+        ui_theme.draw_modal_frame(self.screen, modal_rect, tone="danger", theme=theme)
         
-        # Draw semi-transparent overlay
-        overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 150))
-        self.screen.blit(overlay, (0, 0))
-        
-        # Draw modal background
-        pygame.draw.rect(self.screen, (50, 50, 70), modal_rect, border_radius=10)
-        pygame.draw.rect(self.screen, (255, 150, 150), modal_rect, 3, border_radius=10)  # Red border for warning
-        
-        # Title
-        title_text = "Reset Current System?"
-        title_surf = self.font.render(title_text, True, self.WHITE)
-        title_rect = title_surf.get_rect(midtop=(modal_rect.centerx, modal_rect.top + 20))
+        title_surf = self.subtitle_font.render("Reset current system?", True, theme.text_primary)
+        title_rect = title_surf.get_rect(topleft=(modal_rect.left + theme.space_xl, modal_rect.top + theme.space_xl))
         self.screen.blit(title_surf, title_rect)
         
-        # Message
-        message_text = "This will discard all current changes and restore"
-        message_surf = self.subtitle_font.render(message_text, True, self.LIGHT_GRAY)
-        message_rect = message_surf.get_rect(midtop=(modal_rect.centerx, title_rect.bottom + 10))
-        self.screen.blit(message_surf, message_rect)
+        body_y = title_rect.bottom + theme.space_md
+        for line in ui_theme.wrap_text(
+            self.tiny_font,
+            "This will discard all current changes and restore the default Sun-Earth-Moon system.",
+            modal_width - 2 * theme.space_xl,
+        ):
+            line_surf = self.tiny_font.render(line, True, theme.text_secondary)
+            self.screen.blit(line_surf, (modal_rect.left + theme.space_xl, body_y))
+            body_y += self.tiny_font.get_linesize() + 2
         
-        message2_text = "the default Sun-Earth-Moon system."
-        message2_surf = self.subtitle_font.render(message2_text, True, self.LIGHT_GRAY)
-        message2_rect = message2_surf.get_rect(midtop=(modal_rect.centerx, message_rect.bottom + 5))
-        self.screen.blit(message2_surf, message2_rect)
-        
-        # Buttons
-        button_width = 120
-        button_height = 40
-        button_spacing = 20
-        
-        # Yes button (green/confirm)
-        yes_btn_rect = pygame.Rect(modal_rect.centerx - button_width - button_spacing // 2, modal_rect.bottom - 60, button_width, button_height)
-        pygame.draw.rect(self.screen, (100, 200, 100), yes_btn_rect, border_radius=5)
-        yes_text = self.subtitle_font.render("Yes", True, self.WHITE)
-        self.screen.blit(yes_text, yes_text.get_rect(center=yes_btn_rect.center))
+        button_width, button_height, gap = 120, 40, theme.space_md
+        button_y = modal_rect.bottom - button_height - theme.space_xl
+        cancel_btn_rect = pygame.Rect(modal_rect.right - theme.space_xl - 2 * button_width - gap, button_y, button_width, button_height)
+        yes_btn_rect = pygame.Rect(modal_rect.right - theme.space_xl - button_width, button_y, button_width, button_height)
+        ui_theme.draw_button(self.screen, cancel_btn_rect, "Cancel", self.tiny_font, kind="secondary", hover=cancel_btn_rect.collidepoint(mouse), theme=theme)
+        ui_theme.draw_button(self.screen, yes_btn_rect, "Reset", self.tiny_font, kind="danger", hover=yes_btn_rect.collidepoint(mouse), theme=theme)
         self.reset_confirm_yes_rect = yes_btn_rect  # Store for click detection
-        
-        # Cancel button (red)
-        cancel_btn_rect = pygame.Rect(modal_rect.centerx + button_spacing // 2, modal_rect.bottom - 60, button_width, button_height)
-        pygame.draw.rect(self.screen, (200, 100, 100), cancel_btn_rect, border_radius=5)
-        cancel_text = self.subtitle_font.render("Cancel", True, self.WHITE)
-        self.screen.blit(cancel_text, cancel_text.get_rect(center=cancel_btn_rect.center))
         self.reset_confirm_cancel_rect = cancel_btn_rect  # Store for click detection
 
     def draw_system_menu_confirm_modal(self):
         """Draw a lightweight confirmation modal for System Menu preset changes."""
         if not self.system_menu_confirm_modal:
             return
+        theme = self.theme
+        mouse = self._mouse_pos()
 
         modal_width = 420
         modal_height = 180
@@ -2702,19 +2662,11 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             modal_height,
         )
         self.system_menu_confirm_modal_rect = modal_rect
-
-        # Semi-transparent overlay
-        overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 140))
-        self.screen.blit(overlay, (0, 0))
-
-        # Panel
-        pygame.draw.rect(self.screen, (45, 50, 70), modal_rect, border_radius=10)
-        pygame.draw.rect(self.screen, (150, 190, 255), modal_rect, 2, border_radius=10)
+        ui_theme.draw_modal_frame(self.screen, modal_rect, tone="warning", theme=theme)
 
         # Title and message depend on preset vs load-file
         if getattr(self, "system_menu_pending_load_file", None):
-            title_text = "Load Saved System?"
+            title_text = "Load saved system?"
             msg2 = self.system_menu_pending_load_file
             show_msg2 = True
         else:
@@ -2724,49 +2676,30 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 "earth_moon_sun": "Earth–Moon–Sun",
                 "solar_system": "Solar System",
                 "trappist_1": "TRAPPIST-1",
+                "kepler_62": "Kepler-62",
                 "alpha_centauri": "Alpha Centauri",
             }
             preset_label = preset_label_map.get(preset_key, "Preset System")
             title_text = f"Load {preset_label}?"
             msg2 = preset_label
             show_msg2 = False
-        title_surf = self.font.render(title_text, True, self.WHITE)
-        title_rect = title_surf.get_rect(midtop=(modal_rect.centerx, modal_rect.top + 18))
+        title_surf = self.subtitle_font.render(title_text, True, theme.text_primary)
+        title_rect = title_surf.get_rect(topleft=(modal_rect.left + theme.space_xl, modal_rect.top + theme.space_xl))
         self.screen.blit(title_surf, title_rect)
-        msg1 = "This will delete the current system."
-        msg1_surf = self.subtitle_font.render(msg1, True, self.LIGHT_GRAY)
-        msg1_rect = msg1_surf.get_rect(midtop=(modal_rect.centerx, title_rect.bottom + 10))
+        msg1_surf = self.tiny_font.render("This will replace the current system.", True, theme.text_secondary)
+        msg1_rect = msg1_surf.get_rect(topleft=(modal_rect.left + theme.space_xl, title_rect.bottom + theme.space_md))
         self.screen.blit(msg1_surf, msg1_rect)
         if show_msg2:
-            msg2_surf = self.subtitle_font.render(msg2[:50] + ("..." if len(msg2) > 50 else ""), True, self.LIGHT_GRAY)
-            msg2_rect = msg2_surf.get_rect(midtop=(modal_rect.centerx, msg1_rect.bottom + 4))
-            self.screen.blit(msg2_surf, msg2_rect)
+            msg2_surf = self.tiny_font.render(msg2[:50] + ("..." if len(msg2) > 50 else ""), True, theme.text_tertiary)
+            self.screen.blit(msg2_surf, msg2_surf.get_rect(topleft=(modal_rect.left + theme.space_xl, msg1_rect.bottom + 4)))
 
-        # Buttons
-        button_width = 110
-        button_height = 38
-        button_spacing = 24
-
-        yes_btn_rect = pygame.Rect(
-            modal_rect.centerx - button_width - button_spacing // 2,
-            modal_rect.bottom - 60,
-            button_width,
-            button_height,
-        )
-        pygame.draw.rect(self.screen, (90, 185, 120), yes_btn_rect, border_radius=5)
-        yes_text = self.subtitle_font.render("Yes", True, self.WHITE)
-        self.screen.blit(yes_text, yes_text.get_rect(center=yes_btn_rect.center))
+        button_width, button_height, gap = 110, 38, theme.space_md
+        button_y = modal_rect.bottom - button_height - theme.space_xl
+        cancel_btn_rect = pygame.Rect(modal_rect.right - theme.space_xl - 2 * button_width - gap, button_y, button_width, button_height)
+        yes_btn_rect = pygame.Rect(modal_rect.right - theme.space_xl - button_width, button_y, button_width, button_height)
+        ui_theme.draw_button(self.screen, cancel_btn_rect, "Cancel", self.tiny_font, kind="secondary", hover=cancel_btn_rect.collidepoint(mouse), theme=theme)
+        ui_theme.draw_button(self.screen, yes_btn_rect, "Load", self.tiny_font, kind="primary", hover=yes_btn_rect.collidepoint(mouse), theme=theme)
         self.system_menu_confirm_yes_rect = yes_btn_rect
-
-        cancel_btn_rect = pygame.Rect(
-            modal_rect.centerx + button_spacing // 2,
-            modal_rect.bottom - 60,
-            button_width,
-            button_height,
-        )
-        pygame.draw.rect(self.screen, (180, 100, 110), cancel_btn_rect, border_radius=5)
-        cancel_text = self.subtitle_font.render("Cancel", True, self.WHITE)
-        self.screen.blit(cancel_text, cancel_text.get_rect(center=cancel_btn_rect.center))
         self.system_menu_confirm_cancel_rect = cancel_btn_rect
 
     def draw_load_system_list(self):
@@ -2808,16 +2741,15 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         menu_bg = pygame.Rect(menu_x - 1, menu_y - 1, menu_width + 2, total_height + 2)
         # Store bounds so event handler can accurately detect outside clicks
         self.load_system_list_bounds = menu_bg
-        pygame.draw.rect(self.screen, (25, 30, 40), menu_bg, border_radius=4)
-        pygame.draw.rect(self.screen, (80, 90, 110), menu_bg, 1, border_radius=4)
+        ui_theme.draw_menu_surface(self.screen, menu_bg, self.theme)
         self.load_system_list_rects = []
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self._mouse_pos()
         for i, f in enumerate(files):
             r = pygame.Rect(menu_x, menu_y + i * item_height, menu_width, item_height)
             self.load_system_list_rects.append(r)
-            color = (70, 100, 150) if r.collidepoint(mouse_pos) else (35, 42, 55)
+            color = self.theme.hover if r.collidepoint(mouse_pos) else self.theme.menu_bg
             pygame.draw.rect(self.screen, color, r)
-            label = self.tiny_font.render(f[:35] + ("..." if len(f) > 35 else ""), True, (220, 220, 220))
+            label = self.tiny_font.render(f[:35] + ("..." if len(f) > 35 else ""), True, self.theme.text_secondary)
             self.screen.blit(label, (r.left + 8, r.centery - label.get_height() // 2))
         if not files:
             no_surf = self.tiny_font.render("No saved systems", True, self.LIGHT_GRAY)
@@ -2827,95 +2759,78 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         """Draw Save System name prompt modal."""
         if not getattr(self, "save_system_modal_visible", False):
             return
-        mw, mh = 400, 160
+        theme = self.theme
+        mouse = self._mouse_pos()
+        mw, mh = 400, 176
         rect = pygame.Rect((self.width - mw) // 2, (self.height - mh) // 2, mw, mh)
         self.save_system_modal_rect = rect
-        overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 140))
-        self.screen.blit(overlay, (0, 0))
-        pygame.draw.rect(self.screen, (45, 50, 70), rect, border_radius=10)
-        pygame.draw.rect(self.screen, (100, 150, 200), rect, 2, border_radius=10)
-        title = self.font.render("Save System", True, self.WHITE)
-        self.screen.blit(title, title.get_rect(midtop=(rect.centerx, rect.top + 16)))
-        prompt = self.subtitle_font.render("Enter name:", True, self.LIGHT_GRAY)
-        self.screen.blit(prompt, (rect.left + 20, rect.top + 50))
-        input_rect = pygame.Rect(rect.left + 20, rect.top + 72, rect.width - 40, 28)
-        pygame.draw.rect(self.screen, (30, 35, 45), input_rect)
-        pygame.draw.rect(self.screen, (80, 90, 110), input_rect, 1)
+        ui_theme.draw_modal_frame(self.screen, rect, tone="neutral", theme=theme)
+        title = self.subtitle_font.render("Save System", True, theme.text_primary)
+        self.screen.blit(title, title.get_rect(topleft=(rect.left + theme.space_xl, rect.top + theme.space_xl)))
+        prompt = self.tiny_font.render("Name", True, theme.text_secondary)
+        self.screen.blit(prompt, (rect.left + theme.space_xl, rect.top + 56))
+        input_rect = pygame.Rect(rect.left + theme.space_xl, rect.top + 74, rect.width - 2 * theme.space_xl, 30)
+        ui_theme.draw_input_field(self.screen, input_rect, focused=True, theme=theme)
         text = getattr(self, "save_system_name_text", "")
-        text_surf = self.subtitle_font.render(text + "_", True, self.WHITE)
-        self.screen.blit(text_surf, (input_rect.left + 6, input_rect.centery - text_surf.get_height() // 2))
-        bw, bh = 90, 34
-        save_rect = pygame.Rect(rect.centerx - bw - 10, rect.bottom - 50, bw, bh)
-        pygame.draw.rect(self.screen, (90, 185, 120), save_rect, border_radius=5)
-        self.screen.blit(self.subtitle_font.render("Save", True, self.WHITE), self.subtitle_font.render("Save", True, self.WHITE).get_rect(center=save_rect.center))
+        caret = "|" if (pygame.time.get_ticks() // 500) % 2 == 0 else ""
+        text_surf = self.subtitle_font.render(text + caret, True, theme.text_primary)
+        self.screen.blit(text_surf, (input_rect.left + 8, input_rect.centery - text_surf.get_height() // 2))
+        bw, bh, gap = 90, 34, theme.space_md
+        by = rect.bottom - bh - theme.space_lg
+        cancel_rect = pygame.Rect(rect.right - theme.space_xl - 2 * bw - gap, by, bw, bh)
+        save_rect = pygame.Rect(rect.right - theme.space_xl - bw, by, bw, bh)
+        ui_theme.draw_button(self.screen, cancel_rect, "Cancel", self.tiny_font, kind="secondary", hover=cancel_rect.collidepoint(mouse), theme=theme)
+        ui_theme.draw_button(self.screen, save_rect, "Save", self.tiny_font, kind="primary", hover=save_rect.collidepoint(mouse), theme=theme)
         self.save_system_confirm_rect = save_rect
-        cancel_rect = pygame.Rect(rect.centerx + 10, rect.bottom - 50, bw, bh)
-        pygame.draw.rect(self.screen, (180, 100, 110), cancel_rect, border_radius=5)
-        self.screen.blit(self.subtitle_font.render("Cancel", True, self.WHITE), self.subtitle_font.render("Cancel", True, self.WHITE).get_rect(center=cancel_rect.center))
         self.save_system_cancel_rect = cancel_rect
 
     def draw_system_seed_export_modal(self):
         """Draw System Seed export modal (shows/copies seed)."""
         if not getattr(self, "system_seed_export_modal_visible", False):
             return
-        mw, mh = 640, 240
+        theme = self.theme
+        mouse = self._mouse_pos()
+        mw, mh = 640, 250
         rect = pygame.Rect((self.width - mw) // 2, (self.height - mh) // 2, mw, mh)
         self.system_seed_export_modal_rect = rect
-        overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 140))
-        self.screen.blit(overlay, (0, 0))
-        pygame.draw.rect(self.screen, (45, 50, 70), rect, border_radius=10)
-        pygame.draw.rect(self.screen, (120, 170, 220), rect, 2, border_radius=10)
+        ui_theme.draw_modal_frame(self.screen, rect, tone="neutral", theme=theme)
 
-        title = self.font.render("System Seed Export", True, self.WHITE)
-        self.screen.blit(title, title.get_rect(midtop=(rect.centerx, rect.top + 16)))
+        title = self.subtitle_font.render("System Seed Export", True, theme.text_primary)
+        self.screen.blit(title, title.get_rect(topleft=(rect.left + theme.space_xl, rect.top + theme.space_xl)))
 
         seed = getattr(self, "system_seed_export_text", "") or ""
         preview = seed[:156] + ("..." if len(seed) > 156 else "")
         info1 = "Seed is ready. Copy it into another tool." if seed else ""
         if getattr(self, "_clipboard_available", False) and seed:
             info1 = "Seed is ready. It is also in your clipboard."
-        info_surf = self.tiny_font.render(info1, True, self.LIGHT_GRAY)
-        self.screen.blit(info_surf, (rect.left + 20, rect.top + 54))
+        info_surf = self.tiny_font.render(info1, True, theme.text_secondary)
+        self.screen.blit(info_surf, (rect.left + theme.space_xl, rect.top + 56))
 
-        box = pygame.Rect(rect.left + 20, rect.top + 78, rect.width - 40, 70)
+        box = pygame.Rect(rect.left + theme.space_xl, rect.top + 80, rect.width - 2 * theme.space_xl, 72)
         self.system_seed_export_text_rect = box
-        pygame.draw.rect(self.screen, (30, 35, 45), box, border_radius=6)
-        if getattr(self, "system_seed_export_text_selected", False):
+        selected = bool(getattr(self, "system_seed_export_text_selected", False))
+        ui_theme.draw_input_field(self.screen, box, focused=selected, theme=theme)
+        if selected:
             sel_overlay = pygame.Surface((box.width, box.height), pygame.SRCALPHA)
-            sel_overlay.fill((70, 120, 210, 85))
+            r_, g_, b_ = theme.accent
+            pygame.draw.rect(sel_overlay, (r_, g_, b_, 70), sel_overlay.get_rect(), border_radius=theme.radius_sm)
             self.screen.blit(sel_overlay, box.topleft)
-            pygame.draw.rect(self.screen, (130, 170, 230), box, 2, border_radius=6)
+        # Render preview in 3 lines for readability
+        for i, chunk in enumerate((preview[:52], preview[52:104], preview[104:156])):
+            t = self.tiny_font.render(chunk, True, theme.text_primary)
+            self.screen.blit(t, (box.left + 10, box.top + 8 + i * 18))
+        if selected:
+            sel_hint = self.micro_font.render("Selected - press Ctrl+C to copy", True, theme.accent_soft)
         else:
-            pygame.draw.rect(self.screen, (80, 90, 110), box, 1, border_radius=6)
-        # Render preview in 2 lines for readability
-        line1 = preview[:52]
-        line2 = preview[52:104]
-        line3 = preview[104:156]
-        t1 = self.tiny_font.render(line1, True, (235, 235, 235))
-        t2 = self.tiny_font.render(line2, True, (235, 235, 235))
-        t3 = self.tiny_font.render(line3, True, (235, 235, 235))
-        self.screen.blit(t1, (box.left + 8, box.top + 10))
-        self.screen.blit(t2, (box.left + 8, box.top + 28))
-        self.screen.blit(t3, (box.left + 8, box.top + 46))
-        if getattr(self, "system_seed_export_text_selected", False):
-            sel_hint = self.micro_font.render("Selected - press Ctrl+C to copy", True, (180, 210, 250))
-        else:
-            sel_hint = self.micro_font.render("Hold right-click and drag on text to highlight", True, self.LIGHT_GRAY)
-        self.screen.blit(sel_hint, (box.left + 8, box.bottom - 16))
+            sel_hint = self.micro_font.render("Hold right-click and drag on text to highlight", True, theme.text_tertiary)
+        self.screen.blit(sel_hint, (box.left, box.bottom + 6))
 
-        bw, bh = 110, 34
-        gap = 14
-        left_x = rect.centerx - (bw * 2 + gap) // 2
-        copy_rect = pygame.Rect(left_x, rect.bottom - 52, bw, bh)
-        close_rect = pygame.Rect(left_x + bw + gap, rect.bottom - 52, bw, bh)
-        pygame.draw.rect(self.screen, (120, 130, 150), copy_rect, border_radius=5)
-        pygame.draw.rect(self.screen, (120, 130, 150), close_rect, border_radius=5)
-        self.screen.blit(self.subtitle_font.render("Copy", True, self.WHITE),
-                          self.subtitle_font.render("Copy", True, self.WHITE).get_rect(center=copy_rect.center))
-        self.screen.blit(self.subtitle_font.render("Close", True, self.WHITE),
-                          self.subtitle_font.render("Close", True, self.WHITE).get_rect(center=close_rect.center))
+        bw, bh, gap = 110, 34, theme.space_md
+        by = rect.bottom - bh - theme.space_lg
+        close_rect = pygame.Rect(rect.right - theme.space_xl - 2 * bw - gap, by, bw, bh)
+        copy_rect = pygame.Rect(rect.right - theme.space_xl - bw, by, bw, bh)
+        ui_theme.draw_button(self.screen, close_rect, "Close", self.tiny_font, kind="secondary", hover=close_rect.collidepoint(mouse), theme=theme)
+        ui_theme.draw_button(self.screen, copy_rect, "Copy", self.tiny_font, kind="primary", hover=copy_rect.collidepoint(mouse), theme=theme)
         self.system_seed_export_copy_rect = copy_rect
         self.system_seed_export_close_rect = close_rect
 
@@ -2923,45 +2838,30 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         """Draw System Seed import modal (browse file or clipboard)."""
         if not getattr(self, "system_seed_import_modal_visible", False):
             return
+        theme = self.theme
+        mouse = self._mouse_pos()
         mw, mh = 640, 220
         rect = pygame.Rect((self.width - mw) // 2, (self.height - mh) // 2, mw, mh)
         self.system_seed_import_modal_rect = rect
-        overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 140))
-        self.screen.blit(overlay, (0, 0))
-        pygame.draw.rect(self.screen, (45, 50, 70), rect, border_radius=10)
-        pygame.draw.rect(self.screen, (120, 170, 220), rect, 2, border_radius=10)
+        ui_theme.draw_modal_frame(self.screen, rect, tone="neutral", theme=theme)
 
-        title = self.font.render("System Seed Import", True, self.WHITE)
-        self.screen.blit(title, title.get_rect(midtop=(rect.centerx, rect.top + 16)))
+        title = self.subtitle_font.render("System Seed Import", True, theme.text_primary)
+        self.screen.blit(title, title.get_rect(topleft=(rect.left + theme.space_xl, rect.top + theme.space_xl)))
         hint = "Choose a seed .txt file (e.g. system_seed.txt from an export)."
-        hint_surf = self.tiny_font.render(hint, True, self.LIGHT_GRAY)
-        self.screen.blit(hint_surf, (rect.left + 20, rect.top + 54))
+        hint_surf = self.tiny_font.render(hint, True, theme.text_secondary)
+        self.screen.blit(hint_surf, (rect.left + theme.space_xl, rect.top + 60))
         hint2 = "Or import directly from your clipboard if you copied a seed."
-        hint2_surf = self.tiny_font.render(hint2, True, self.LIGHT_GRAY)
-        self.screen.blit(hint2_surf, (rect.left + 20, rect.top + 74))
+        hint2_surf = self.tiny_font.render(hint2, True, theme.text_secondary)
+        self.screen.blit(hint2_surf, (rect.left + theme.space_xl, rect.top + 82))
 
-        bw, bh = 150, 34
-        gap = 12
-        left_x = rect.centerx - (bw * 2 + gap) // 2
-        browse_rect = pygame.Rect(left_x, rect.bottom - 52, bw, bh)
-        clipboard_rect = pygame.Rect(left_x + bw + gap, rect.bottom - 52, bw, bh)
-        cancel_rect = pygame.Rect(rect.centerx - 55, rect.bottom - 96, 110, 30)
-        pygame.draw.rect(self.screen, (90, 185, 120), browse_rect, border_radius=5)
-        pygame.draw.rect(self.screen, (120, 150, 190), clipboard_rect, border_radius=5)
-        pygame.draw.rect(self.screen, (180, 100, 110), cancel_rect, border_radius=5)
-        self.screen.blit(
-            self.subtitle_font.render("Browse File", True, self.WHITE),
-            self.subtitle_font.render("Browse File", True, self.WHITE).get_rect(center=browse_rect.center),
-        )
-        self.screen.blit(
-            self.subtitle_font.render("Clipboard", True, self.WHITE),
-            self.subtitle_font.render("Clipboard", True, self.WHITE).get_rect(center=clipboard_rect.center),
-        )
-        self.screen.blit(
-            self.tiny_font.render("Cancel", True, self.WHITE),
-            self.tiny_font.render("Cancel", True, self.WHITE).get_rect(center=cancel_rect.center),
-        )
+        bw, bh, gap = 150, 34, theme.space_md
+        by = rect.bottom - bh - theme.space_lg
+        clipboard_rect = pygame.Rect(rect.right - theme.space_xl - 2 * bw - gap, by, bw, bh)
+        browse_rect = pygame.Rect(rect.right - theme.space_xl - bw, by, bw, bh)
+        cancel_rect = pygame.Rect(rect.left + theme.space_xl, by, 110, bh)
+        ui_theme.draw_button(self.screen, cancel_rect, "Cancel", self.tiny_font, kind="ghost", hover=cancel_rect.collidepoint(mouse), theme=theme)
+        ui_theme.draw_button(self.screen, clipboard_rect, "From Clipboard", self.tiny_font, kind="secondary", hover=clipboard_rect.collidepoint(mouse), theme=theme)
+        ui_theme.draw_button(self.screen, browse_rect, "Browse File", self.tiny_font, kind="primary", hover=browse_rect.collidepoint(mouse), theme=theme)
         self.system_seed_import_browse_rect = browse_rect
         self.system_seed_import_clipboard_rect = clipboard_rect
         self.system_seed_import_cancel_rect = cancel_rect
@@ -3014,53 +2914,53 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         """Draw modal to name and save the current object as a preset."""
         if not getattr(self, "save_prefab_modal_visible", False):
             return
-        mw, mh = 440, 170
+        theme = self.theme
+        mouse = self._mouse_pos()
+        mw, mh = 440, 176
         rect = pygame.Rect((self.width - mw) // 2, (self.height - mh) // 2, mw, mh)
         self.save_prefab_modal_rect = rect
-        overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 140))
-        self.screen.blit(overlay, (0, 0))
-        pygame.draw.rect(self.screen, (45, 50, 70), rect, border_radius=10)
-        pygame.draw.rect(self.screen, (120, 170, 220), rect, 2, border_radius=10)
+        ui_theme.draw_modal_frame(self.screen, rect, tone="neutral", theme=theme)
 
-        title = self.font.render(self._save_prefab_modal_title(), True, self.WHITE)
-        self.screen.blit(title, title.get_rect(midtop=(rect.centerx, rect.top + 16)))
-        prompt = self.subtitle_font.render("Name:", True, self.LIGHT_GRAY)
-        self.screen.blit(prompt, (rect.left + 20, rect.top + 54))
-        input_rect = pygame.Rect(rect.left + 20, rect.top + 76, rect.width - 40, 28)
-        pygame.draw.rect(self.screen, (30, 35, 45), input_rect)
-        pygame.draw.rect(self.screen, (80, 90, 110), input_rect, 1)
+        title = self.subtitle_font.render(self._save_prefab_modal_title(), True, theme.text_primary)
+        self.screen.blit(title, title.get_rect(topleft=(rect.left + theme.space_xl, rect.top + theme.space_xl)))
+        prompt = self.tiny_font.render("Name", True, theme.text_secondary)
+        self.screen.blit(prompt, (rect.left + theme.space_xl, rect.top + 56))
+        input_rect = pygame.Rect(rect.left + theme.space_xl, rect.top + 74, rect.width - 2 * theme.space_xl, 30)
+        ui_theme.draw_input_field(self.screen, input_rect, focused=True, theme=theme)
         text = getattr(self, "save_prefab_name_text", "")
-        text_surf = self.subtitle_font.render(text + "_", True, self.WHITE)
-        self.screen.blit(text_surf, (input_rect.left + 6, input_rect.centery - text_surf.get_height() // 2))
+        caret = "|" if (pygame.time.get_ticks() // 500) % 2 == 0 else ""
+        text_surf = self.subtitle_font.render(text + caret, True, theme.text_primary)
+        self.screen.blit(text_surf, (input_rect.left + 8, input_rect.centery - text_surf.get_height() // 2))
 
-        bw, bh = 100, 34
-        save_rect = pygame.Rect(rect.centerx - bw - 10, rect.bottom - 52, bw, bh)
-        pygame.draw.rect(self.screen, (90, 185, 120), save_rect, border_radius=5)
-        self.screen.blit(self.subtitle_font.render("Save", True, self.WHITE), self.subtitle_font.render("Save", True, self.WHITE).get_rect(center=save_rect.center))
+        bw, bh, gap = 100, 34, theme.space_md
+        by = rect.bottom - bh - theme.space_lg
+        cancel_rect = pygame.Rect(rect.right - theme.space_xl - 2 * bw - gap, by, bw, bh)
+        save_rect = pygame.Rect(rect.right - theme.space_xl - bw, by, bw, bh)
+        ui_theme.draw_button(self.screen, cancel_rect, "Cancel", self.tiny_font, kind="secondary", hover=cancel_rect.collidepoint(mouse), theme=theme)
+        ui_theme.draw_button(self.screen, save_rect, "Save", self.tiny_font, kind="primary", hover=save_rect.collidepoint(mouse), theme=theme)
         self.save_prefab_confirm_rect = save_rect
-
-        cancel_rect = pygame.Rect(rect.centerx + 10, rect.bottom - 52, bw, bh)
-        pygame.draw.rect(self.screen, (180, 100, 110), cancel_rect, border_radius=5)
-        self.screen.blit(self.subtitle_font.render("Cancel", True, self.WHITE), self.subtitle_font.render("Cancel", True, self.WHITE).get_rect(center=cancel_rect.center))
         self.save_prefab_cancel_rect = cancel_rect
 
     def draw_stability_warning(self):
         """Draw integrator stability warning after load."""
         if not getattr(self, "stability_warning_visible", False):
             return
+        theme = self.theme
+        mouse = self._mouse_pos()
         msg = getattr(self, "stability_warning_message", "")
-        mw, mh = 480, 120
+        mw, mh = 480, 112
         rect = pygame.Rect((self.width - mw) // 2, self.height - mh - 80, mw, mh)
         self.stability_warning_rect = rect
-        pygame.draw.rect(self.screen, (50, 45, 40), rect, border_radius=8)
-        pygame.draw.rect(self.screen, (200, 120, 80), rect, 2, border_radius=8)
-        wrap = msg[:70] + ("..." if len(msg) > 70 else "")
-        surf = self.subtitle_font.render(wrap, True, (240, 220, 200))
-        self.screen.blit(surf, surf.get_rect(midtop=(rect.centerx, rect.top + 20)))
-        dismiss_rect = pygame.Rect(rect.centerx - 50, rect.bottom - 44, 100, 32)
-        pygame.draw.rect(self.screen, (120, 140, 100), dismiss_rect, border_radius=5)
-        self.screen.blit(self.subtitle_font.render("Dismiss", True, self.WHITE), self.subtitle_font.render("Dismiss", True, self.WHITE).get_rect(center=dismiss_rect.center))
+        ui_theme.draw_toast(self.screen, rect, tone="warning", theme=theme)
+        title = self.tiny_font.render("STABILITY", True, theme.warning_soft)
+        self.screen.blit(title, (rect.left + theme.space_lg, rect.top + theme.space_md))
+        y = rect.top + theme.space_md + title.get_height() + 4
+        for line in ui_theme.wrap_text(self.tiny_font, msg, mw - 2 * theme.space_lg)[:2]:
+            surf = self.tiny_font.render(line, True, theme.text_primary)
+            self.screen.blit(surf, (rect.left + theme.space_lg, y))
+            y += self.tiny_font.get_linesize()
+        dismiss_rect = pygame.Rect(rect.right - theme.space_lg - 90, rect.bottom - 30 - theme.space_md, 90, 30)
+        ui_theme.draw_button(self.screen, dismiss_rect, "Dismiss", self.tiny_font, kind="secondary", hover=dismiss_rect.collidepoint(mouse), theme=theme)
         self.stability_warning_dismiss_rect = dismiss_rect
 
     def draw_object_library_panel(self):
@@ -3115,24 +3015,23 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         bg = pygame.Rect(x - 1, y - 1, panel_w + 2, total_h + 2)
         self.object_library_panel_rect = bg
         # Match the background styling used by other dropdown menus
-        pygame.draw.rect(self.screen, self.UI_MENU_BG, bg, border_radius=4)
-        pygame.draw.rect(self.screen, (80, 90, 110), bg, 1, border_radius=4)
+        ui_theme.draw_menu_surface(self.screen, bg, self.theme)
         # Restore slightly larger title
-        title = self.tiny_font.render("Custom Objects", True, (220, 230, 245))
+        title = self.tiny_font.render("Custom Objects", True, self.theme.text_primary)
         self.screen.blit(title, (x + 10, y + 6))
         # Faint divider under title with extra breathing room above first section
         title_div = pygame.Surface((panel_w - 20, 1), pygame.SRCALPHA)
-        title_div.fill((255, 255, 255, 60))
+        title_div.fill(self.theme.panel_border)
         self.screen.blit(title_div, (x + 10, y + 24))
 
         self.object_library_rects = []
         self.object_library_files = []
-        mouse = pygame.mouse.get_pos()
+        mouse = self._mouse_pos()
 
         def draw_section(label: str, items: list[str], y_start: int, empty_text: str) -> int:
             # Section header
-            header_surf = self.tiny_font.render(label, True, (220, 230, 245))
-            self.screen.blit(header_surf, (x + 10, y_start))
+            header_surf = self.micro_font.render(label.upper(), True, self.theme.text_tertiary)
+            self.screen.blit(header_surf, (x + 10, y_start + 2))
             y_cursor = y_start + header_h
             # Items or "No saved ..."
             if items:
@@ -3140,13 +3039,13 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                     r = pygame.Rect(x, y_cursor, panel_w, item_h)
                     self.object_library_rects.append(r)
                     self.object_library_files.append(f)
-                    c = (70, 100, 150) if r.collidepoint(mouse) else (35, 42, 55)
+                    c = self.theme.hover if r.collidepoint(mouse) else self.theme.menu_bg
                     pygame.draw.rect(self.screen, c, r)
                     name = f.replace(".json", "")
-                    self.screen.blit(self.tiny_font.render(name, True, (220, 220, 220)), (r.left + 8, r.centery - 7))
+                    self.screen.blit(self.tiny_font.render(name, True, self.theme.text_secondary), (r.left + 8, r.centery - 7))
                     y_cursor += item_h
             else:
-                txt = self.tiny_font.render(empty_text, True, self.LIGHT_GRAY)
+                txt = self.tiny_font.render(empty_text, True, self.theme.text_tertiary)
                 self.screen.blit(txt, (x + 10, y_cursor + (item_h - txt.get_height()) // 2))
                 y_cursor += item_h
             return y_cursor + section_pad
@@ -3157,14 +3056,14 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
 
         # Faint divider
         div_surf = pygame.Surface((panel_w - 20, 1), pygame.SRCALPHA)
-        div_surf.fill((255, 255, 255, 60))
+        div_surf.fill(self.theme.panel_border)
         self.screen.blit(div_surf, (x + 10, y_cursor))
         y_cursor += divider_h
 
         y_cursor = draw_section("Moons", moons, y_cursor, "No saved moons")
 
         div_surf2 = pygame.Surface((panel_w - 20, 1), pygame.SRCALPHA)
-        div_surf2.fill((255, 255, 255, 60))
+        div_surf2.fill(self.theme.panel_border)
         self.screen.blit(div_surf2, (x + 10, y_cursor))
         y_cursor += divider_h
 
@@ -3174,24 +3073,20 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
 
     def draw_system_menu_button(self):
         """Draw the System Menu (hamburger) button in the top-right corner."""
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self._mouse_pos()
         is_hovering = self.system_menu_rect.collidepoint(mouse_pos)
+        theme = self.theme
 
-        if self.system_menu_visible:
-            bg_color = (70, 70, 90)
-        elif is_hovering:
-            bg_color = (60, 60, 80)
-        else:
-            bg_color = (45, 50, 65)
-
-        pygame.draw.rect(self.screen, bg_color, self.system_menu_rect, border_radius=4)
-        pygame.draw.rect(self.screen, (90, 100, 120), self.system_menu_rect, 1, border_radius=4)
+        ui_theme.draw_toolbar_button(
+            self.screen, self.system_menu_rect,
+            hover=is_hovering, active=self.system_menu_visible, theme=theme,
+        )
 
         # Draw hamburger icon (three horizontal lines)
         cx = self.system_menu_rect.centerx
         cy = self.system_menu_rect.centery
-        line_color = (230, 235, 245)
-        line_half_width = self.system_menu_rect.width // 2 - 6
+        line_color = theme.text_primary if (is_hovering or self.system_menu_visible) else theme.text_secondary
+        line_half_width = self.system_menu_rect.width // 2 - 7
         for dy in (-5, 0, 5):
             pygame.draw.line(
                 self.screen,
@@ -3217,11 +3112,10 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
 
         total_height = len(self.system_menu_options) * item_height
         menu_bg_rect = pygame.Rect(menu_x - 1, menu_y - 1, menu_width + 2, total_height + 2)
-        pygame.draw.rect(self.screen, (25, 30, 40), menu_bg_rect, border_radius=4)
-        pygame.draw.rect(self.screen, (80, 90, 110), menu_bg_rect, 1, border_radius=4)
+        ui_theme.draw_menu_surface(self.screen, menu_bg_rect, self.theme)
 
         self.system_menu_item_rects = []
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self._mouse_pos()
         load_parent_rect = None
         export_parent_rect = None
 
@@ -3234,10 +3128,10 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 (option == "Load System" and getattr(self, "system_menu_load_submenu_visible", False))
                 or (option == "Export" and getattr(self, "system_menu_export_submenu_visible", False))
             )
-            bg_color = (70, 100, 150) if is_hovering else ((55, 75, 110) if is_open_parent else (35, 42, 55))
+            bg_color = self.theme.hover if is_hovering else (self.theme.selected if is_open_parent else self.theme.menu_bg)
             pygame.draw.rect(self.screen, bg_color, item_rect)
 
-            text_color = (255, 255, 255) if is_hovering else (210, 215, 220)
+            text_color = self.theme.text_primary if is_hovering else self.theme.text_secondary
             label = self.tiny_font.render(option, True, text_color)
             label_rect = label.get_rect(midleft=(item_rect.left + 10, item_rect.centery))
             self.screen.blit(label, label_rect)
@@ -3247,39 +3141,21 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 load_parent_rect = item_rect
                 arrow_x = item_rect.right - 12
                 arrow_y = item_rect.centery
-                if getattr(self, "system_menu_load_submenu_visible", False):
-                    # Down arrow when open
-                    arrow_points = [
-                        (arrow_x - 4, arrow_y - 2),
-                        (arrow_x + 4, arrow_y - 2),
-                        (arrow_x, arrow_y + 3),
-                    ]
-                else:
-                    # Right arrow when closed
-                    arrow_points = [
-                        (arrow_x - 2, arrow_y - 4),
-                        (arrow_x - 2, arrow_y + 4),
-                        (arrow_x + 3, arrow_y),
-                    ]
-                pygame.draw.polygon(self.screen, (200, 205, 215), arrow_points)
+                ui_theme.draw_chevron(
+                    self.screen, (arrow_x, arrow_y),
+                    open_=getattr(self, "system_menu_load_submenu_visible", False),
+                    color=text_color,
+                )
             # Export is a parent item with a submenu.
             if option == "Export":
                 export_parent_rect = item_rect
                 arrow_x = item_rect.right - 12
                 arrow_y = item_rect.centery
-                if getattr(self, "system_menu_export_submenu_visible", False):
-                    arrow_points = [
-                        (arrow_x - 4, arrow_y - 2),
-                        (arrow_x + 4, arrow_y - 2),
-                        (arrow_x, arrow_y + 3),
-                    ]
-                else:
-                    arrow_points = [
-                        (arrow_x - 2, arrow_y - 4),
-                        (arrow_x - 2, arrow_y + 4),
-                        (arrow_x + 3, arrow_y),
-                    ]
-                pygame.draw.polygon(self.screen, (200, 205, 215), arrow_points)
+                ui_theme.draw_chevron(
+                    self.screen, (arrow_x, arrow_y),
+                    open_=getattr(self, "system_menu_export_submenu_visible", False),
+                    color=text_color,
+                )
 
         # Compute stacked submenus under main menu, in order:
         # - Load submenu (if open)
@@ -3295,8 +3171,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             sub_y = next_sub_y
             sub_total_h = len(self.system_menu_load_options) * sub_item_h
             sub_bg = pygame.Rect(sub_x - 1, sub_y - 1, sub_w + 2, sub_total_h + 2)
-            pygame.draw.rect(self.screen, (25, 30, 40), sub_bg, border_radius=4)
-            pygame.draw.rect(self.screen, (80, 90, 110), sub_bg, 1, border_radius=4)
+            ui_theme.draw_menu_surface(self.screen, sub_bg, self.theme)
 
             self.system_menu_load_item_rects = []
             y_cursor = sub_y
@@ -3305,9 +3180,9 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 self.system_menu_load_item_rects.append(r)
                 is_hovering = r.collidepoint(mouse_pos)
                 is_open_parent = (option == "Custom" and getattr(self, "load_system_list_visible", False))
-                bg_color = (70, 100, 150) if is_hovering else ((55, 75, 110) if is_open_parent else (35, 42, 55))
+                bg_color = self.theme.hover if is_hovering else (self.theme.selected if is_open_parent else self.theme.menu_bg)
                 pygame.draw.rect(self.screen, bg_color, r)
-                text_color = (255, 255, 255) if is_hovering else (210, 215, 220)
+                text_color = self.theme.text_primary if is_hovering else self.theme.text_secondary
                 label = self.tiny_font.render(option, True, text_color)
                 self.screen.blit(label, label.get_rect(midleft=(r.left + 10, r.centery)))
 
@@ -3321,7 +3196,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                     else:
                         # Right arrow when closed
                         pts = [(arrow_x - 2, arrow_y - 4), (arrow_x - 2, arrow_y + 4), (arrow_x + 3, arrow_y)]
-                    pygame.draw.polygon(self.screen, (200, 205, 215), pts)
+                    pygame.draw.polygon(self.screen, self.theme.text_secondary, pts)
 
                 y_cursor += sub_item_h
 
@@ -3337,8 +3212,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             sub_y = next_sub_y
             sub_total_h = len(self.export_dropdown_options) * sub_item_h
             sub_bg = pygame.Rect(sub_x - 1, sub_y - 1, sub_w + 2, sub_total_h + 2)
-            pygame.draw.rect(self.screen, (25, 30, 40), sub_bg, border_radius=4)
-            pygame.draw.rect(self.screen, (80, 90, 110), sub_bg, 1, border_radius=4)
+            ui_theme.draw_menu_surface(self.screen, sub_bg, self.theme)
 
             self.system_menu_export_item_rects = []
             y_cursor = sub_y
@@ -3346,9 +3220,9 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 r = pygame.Rect(sub_x, y_cursor, sub_w, sub_item_h)
                 self.system_menu_export_item_rects.append(r)
                 is_hovering = r.collidepoint(mouse_pos)
-                bg_color = (70, 100, 150) if is_hovering else (35, 42, 55)
+                bg_color = self.theme.hover if is_hovering else self.theme.menu_bg
                 pygame.draw.rect(self.screen, bg_color, r)
-                text_color = (255, 255, 255) if is_hovering else (210, 215, 220)
+                text_color = self.theme.text_primary if is_hovering else self.theme.text_secondary
                 label = self.tiny_font.render(option, True, text_color)
                 old_clip = self.screen.get_clip()
                 self.screen.set_clip(r)
@@ -3363,58 +3237,38 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
     
     def draw_add_body_dropdown(self):
         """Draw the 'Add Body' dropdown button and its options if visible."""
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self._mouse_pos()
         is_hovering = self.add_body_dropdown_rect.collidepoint(mouse_pos)
+        theme = self.theme
         
-        # Flat button colors
-        if self.add_body_dropdown_visible:
-            bg_color = (60, 80, 110)
-        elif is_hovering:
-            bg_color = (55, 75, 100)
-        else:
-            bg_color = (45, 65, 90)
+        ui_theme.draw_toolbar_button(
+            self.screen, self.add_body_dropdown_rect,
+            hover=is_hovering, active=self.add_body_dropdown_visible, theme=theme,
+        )
         
-        # Draw button background
-        pygame.draw.rect(self.screen, bg_color, self.add_body_dropdown_rect, border_radius=4)
-        pygame.draw.rect(self.screen, (80, 100, 130), self.add_body_dropdown_rect, 1, border_radius=4)
-        
-        # Draw label with dropdown arrow
         # Keep the button label constant for clarity (submenus show context).
         label_text = "Add Body"
-        label = self.tiny_font.render(label_text, True, (220, 220, 220))
+        label_color = theme.text_primary if (is_hovering or self.add_body_dropdown_visible) else theme.text_secondary
+        label = self.tiny_font.render(label_text, True, label_color)
         label_rect = label.get_rect(center=self.add_body_dropdown_rect.center)
-        label_rect.x -= 6  # Shift left to make room for arrow
+        label_rect.x -= 6  # Shift left to make room for chevron
         self.screen.blit(label, label_rect)
         
-        # Draw dropdown arrow
-        arrow_x = self.add_body_dropdown_rect.right - 14
-        arrow_y = self.add_body_dropdown_rect.centery
-        if self.add_body_dropdown_visible:
-            # Down arrow when open
-            arrow_points = [
-                (arrow_x - 4, arrow_y - 2),
-                (arrow_x + 4, arrow_y - 2),
-                (arrow_x, arrow_y + 3),
-            ]
-        else:
-            # Right arrow when closed
-            arrow_points = [
-                (arrow_x - 2, arrow_y - 4),
-                (arrow_x - 2, arrow_y + 4),
-                (arrow_x + 3, arrow_y),
-            ]
-        pygame.draw.polygon(self.screen, (180, 180, 180), arrow_points)
+        ui_theme.draw_chevron(
+            self.screen,
+            (self.add_body_dropdown_rect.right - 14, self.add_body_dropdown_rect.centery),
+            open_=self.add_body_dropdown_visible,
+            color=label_color,
+        )
         
         # When in placement mode, draw Cancel button next to Add Body
         if self.placement_mode_active:
             cancel_rect = self.placement_cancel_button_rect
             cancel_hover = cancel_rect.collidepoint(mouse_pos)
-            cancel_bg = (70, 55, 55) if cancel_hover else (55, 45, 45)
-            pygame.draw.rect(self.screen, cancel_bg, cancel_rect, border_radius=4)
-            pygame.draw.rect(self.screen, (120, 80, 80), cancel_rect, 1, border_radius=4)
-            cancel_label = self.tiny_font.render("Cancel", True, (220, 200, 200))
-            cancel_label_rect = cancel_label.get_rect(center=cancel_rect.center)
-            self.screen.blit(cancel_label, cancel_label_rect)
+            ui_theme.draw_button(
+                self.screen, cancel_rect, "Cancel", self.tiny_font,
+                kind="ghost", hover=cancel_hover, theme=theme,
+            )
 
     def draw_add_body_dropdown_menu(self):
         """Draw the expanded Add Body dropdown menu."""
@@ -3430,11 +3284,10 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         # Draw menu background/shadow first
         total_height = len(self.add_body_options) * item_height
         menu_bg_rect = pygame.Rect(menu_x - 1, menu_y - 1, menu_width + 2, total_height + 2)
-        pygame.draw.rect(self.screen, (25, 30, 40), menu_bg_rect, border_radius=4)
-        pygame.draw.rect(self.screen, (80, 90, 110), menu_bg_rect, 1, border_radius=4)
+        ui_theme.draw_menu_surface(self.screen, menu_bg_rect, self.theme)
         
         self.add_body_dropdown_item_rects = []
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self._mouse_pos()
         
         for i, option in enumerate(self.add_body_options):
             item_rect = pygame.Rect(menu_x, menu_y + i * item_height, menu_width, item_height)
@@ -3445,20 +3298,20 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             
             # Background color - faint light blue on hover
             if is_hovering:
-                bg_color = (70, 100, 150)  # Brighter light blue highlight
+                bg_color = self.theme.hover  # Brighter light blue highlight
             elif option == "Planets" and getattr(self, "planets_family_dropdown_visible", False):
-                bg_color = (55, 75, 110)
+                bg_color = self.theme.selected
             elif option == "Stars" and getattr(self, "stars_family_dropdown_visible", False):
-                bg_color = (55, 75, 110)
+                bg_color = self.theme.selected
             elif is_selected:
-                bg_color = (55, 75, 110)
+                bg_color = self.theme.selected
             else:
-                bg_color = (35, 42, 55)
+                bg_color = self.theme.menu_bg
             
             pygame.draw.rect(self.screen, bg_color, item_rect)
             
             # Option text
-            text_color = (255, 255, 255) if is_hovering else (210, 215, 220)
+            text_color = self.theme.text_primary if is_hovering else self.theme.text_secondary
             option_label = self.tiny_font.render(option, True, text_color)
             option_rect = option_label.get_rect(midleft=(item_rect.left + 12, item_rect.centery))
             self.screen.blit(option_label, option_rect)
@@ -3467,7 +3320,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             if option in ("Planets", "Stars"):
                 arrow_x = item_rect.right - 12
                 arrow_y = item_rect.centery
-                arrow_color = (200, 210, 230) if is_hovering else (140, 150, 170)
+                arrow_color = self.theme.text_primary if is_hovering else self.theme.text_tertiary
                 is_open = False
                 if option == "Planets":
                     is_open = bool(getattr(self, "planets_family_dropdown_visible", False))
@@ -3509,23 +3362,22 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
 
             self.planets_family_dropdown_rect = pygame.Rect(fam_x, fam_y, fam_w, fam_total_h)
             fam_bg = pygame.Rect(fam_x - 1, fam_y - 1, fam_w + 2, fam_total_h + 2)
-            pygame.draw.rect(self.screen, (25, 30, 40), fam_bg, border_radius=4)
-            pygame.draw.rect(self.screen, (80, 90, 110), fam_bg, 1, border_radius=4)
+            ui_theme.draw_menu_surface(self.screen, fam_bg, self.theme)
 
-            mouse_pos = pygame.mouse.get_pos()
+            mouse_pos = self._mouse_pos()
             for i, fam in enumerate(self.planets_family_options):
                 r = pygame.Rect(fam_x, fam_y + i * fam_item_h, fam_w, fam_item_h)
                 hov = r.collidepoint(mouse_pos)
                 sel = (self.planets_family_selected == fam)
                 if hov:
-                    bg = (70, 100, 150)
+                    bg = self.theme.hover
                 elif sel:
-                    bg = (55, 75, 110)
+                    bg = self.theme.selected
                 else:
-                    bg = (35, 42, 55)
+                    bg = self.theme.menu_bg
                 pygame.draw.rect(self.screen, bg, r)
 
-                tcol = (255, 255, 255) if hov else (210, 215, 220)
+                tcol = self.theme.text_primary if hov else self.theme.text_secondary
                 # Fit label text so it doesn't cover the submenu arrow
                 avail_w = (r.width - 10 - 18)  # left pad + arrow gutter
                 text = fam
@@ -3542,7 +3394,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 # Arrow indicating 2nd-level submenu
                 arrow_x = r.right - 12
                 arrow_y = r.centery
-                arrow_color = (200, 210, 230) if hov else (140, 150, 170)
+                arrow_color = self.theme.text_primary if hov else self.theme.text_tertiary
                 is_open = bool(getattr(self, "planets_list_dropdown_visible", False)) and getattr(self, "planets_family_selected", None) == fam
                 if is_open:
                     arrow_points = [(arrow_x - 4, arrow_y - 2), (arrow_x + 4, arrow_y - 2), (arrow_x, arrow_y + 3)]
@@ -3556,6 +3408,8 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                     planet_names = list(SOLAR_SYSTEM_PLANET_PRESETS.keys())
                 elif self.planets_family_selected == "TRAPPIST-1":
                     planet_names = list(getattr(self, "trappist1_planet_presets", {}).keys())
+                elif self.planets_family_selected == "Kepler-62":
+                    planet_names = list(getattr(self, "kepler62_planet_presets", {}).keys())
                 else:
                     planet_names = list(getattr(self, "alpha_centauri_planet_presets", {}).keys())
 
@@ -3567,21 +3421,20 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
 
                 self.planets_list_dropdown_rect = pygame.Rect(list_x, list_y, list_w, list_total_h)
                 list_bg = pygame.Rect(list_x - 1, list_y - 1, list_w + 2, list_total_h + 2)
-                pygame.draw.rect(self.screen, (25, 30, 40), list_bg, border_radius=4)
-                pygame.draw.rect(self.screen, (80, 90, 110), list_bg, 1, border_radius=4)
+                ui_theme.draw_menu_surface(self.screen, list_bg, self.theme)
 
                 for i, pname in enumerate(planet_names):
                     r = pygame.Rect(list_x, list_y + i * list_item_h, list_w, list_item_h)
                     hov = r.collidepoint(mouse_pos)
                     sel = (self.planet_dropdown_selected == pname)
                     if hov:
-                        bg = (70, 100, 150)
+                        bg = self.theme.hover
                     elif sel:
-                        bg = (55, 75, 110)
+                        bg = self.theme.selected
                     else:
-                        bg = (35, 42, 55)
+                        bg = self.theme.menu_bg
                     pygame.draw.rect(self.screen, bg, r)
-                    tcol = (255, 255, 255) if hov else (210, 215, 220)
+                    tcol = self.theme.text_primary if hov else self.theme.text_secondary
                     label = self.tiny_font.render(pname, True, tcol)
                     self.screen.blit(label, label.get_rect(midleft=(r.left + 10, r.centery)))
 
@@ -3604,23 +3457,22 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
 
             self.stars_family_dropdown_rect = pygame.Rect(fam_x, fam_y, fam_w, fam_total_h)
             fam_bg = pygame.Rect(fam_x - 1, fam_y - 1, fam_w + 2, fam_total_h + 2)
-            pygame.draw.rect(self.screen, (25, 30, 40), fam_bg, border_radius=4)
-            pygame.draw.rect(self.screen, (80, 90, 110), fam_bg, 1, border_radius=4)
+            ui_theme.draw_menu_surface(self.screen, fam_bg, self.theme)
 
-            mouse_pos = pygame.mouse.get_pos()
+            mouse_pos = self._mouse_pos()
             for i, fam in enumerate(self.stars_family_options):
                 r = pygame.Rect(fam_x, fam_y + i * fam_item_h, fam_w, fam_item_h)
                 hov = r.collidepoint(mouse_pos)
                 sel = (self.stars_family_selected == fam)
                 if hov:
-                    bg = (70, 100, 150)
+                    bg = self.theme.hover
                 elif sel:
-                    bg = (55, 75, 110)
+                    bg = self.theme.selected
                 else:
-                    bg = (35, 42, 55)
+                    bg = self.theme.menu_bg
                 pygame.draw.rect(self.screen, bg, r)
 
-                tcol = (255, 255, 255) if hov else (210, 215, 220)
+                tcol = self.theme.text_primary if hov else self.theme.text_secondary
                 label = self.tiny_font.render(fam, True, tcol)
                 self.screen.blit(label, label.get_rect(midleft=(r.left + 10, r.centery)))
 
@@ -3628,7 +3480,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 if fam == "Alpha Centauri":
                     arrow_x = r.right - 12
                     arrow_y = r.centery
-                    arrow_color = (200, 210, 230) if hov else (140, 150, 170)
+                    arrow_color = self.theme.text_primary if hov else self.theme.text_tertiary
                     is_open = bool(getattr(self, "stars_list_dropdown_visible", False)) and getattr(self, "stars_family_selected", None) == "Alpha Centauri"
                     if is_open:
                         arrow_points = [(arrow_x - 4, arrow_y - 2), (arrow_x + 4, arrow_y - 2), (arrow_x, arrow_y + 3)]
@@ -3647,37 +3499,134 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
 
                 self.stars_list_dropdown_rect = pygame.Rect(list_x, list_y, list_w, list_total_h)
                 list_bg = pygame.Rect(list_x - 1, list_y - 1, list_w + 2, list_total_h + 2)
-                pygame.draw.rect(self.screen, (25, 30, 40), list_bg, border_radius=4)
-                pygame.draw.rect(self.screen, (80, 90, 110), list_bg, 1, border_radius=4)
+                ui_theme.draw_menu_surface(self.screen, list_bg, self.theme)
 
                 for i, sname in enumerate(star_names):
                     r = pygame.Rect(list_x, list_y + i * list_item_h, list_w, list_item_h)
                     hov = r.collidepoint(mouse_pos)
                     sel = (self.star_name_selected == sname)
                     if hov:
-                        bg = (70, 100, 150)
+                        bg = self.theme.hover
                     elif sel:
-                        bg = (55, 75, 110)
+                        bg = self.theme.selected
                     else:
-                        bg = (35, 42, 55)
+                        bg = self.theme.menu_bg
                     pygame.draw.rect(self.screen, bg, r)
-                    tcol = (255, 255, 255) if hov else (210, 215, 220)
+                    tcol = self.theme.text_primary if hov else self.theme.text_secondary
                     label = self.tiny_font.render(sname, True, tcol)
                     self.screen.blit(label, label.get_rect(midleft=(r.left + 10, r.centery)))
 
     def _draw_customization_field_box(self, rect: pygame.Rect):
         """Draw consistent field box (fill + border) for customization panel."""
-        pygame.draw.rect(self.screen, self.UI_PANEL_BG, rect)
-        pygame.draw.rect(self.screen, self.UI_PANEL_BORDER, rect, 1)
+        ui_theme.draw_input_field(self.screen, rect, theme=self.theme)
+        # Disclosure chevron on the right edge: every field box is a dropdown
+        ui_theme.draw_chevron(
+            self.screen, (rect.right - 12, rect.centery), open_=True, color=self.theme.text_tertiary,
+        )
+
+    def _provenance_kind(self, body: Optional[Dict[str, Any]], field: str) -> Optional[str]:
+        """
+        Presentation-only hint for measured vs assumed parameters.
+
+        Returns 'assumed' for fields that are model inputs rather than observations
+        (atmospheric warming for every body; age for non-Solar-System presets),
+        otherwise None. Reads existing body fields only; never writes.
+        """
+        if not body:
+            return None
+        if field == "atmosphere":
+            return "assumed"
+        if field == "age":
+            preset = body.get("preset_type") or body.get("name")
+            if preset in SOLAR_SYSTEM_PLANET_PRESETS or body.get("type") == "moon":
+                return None
+            return "assumed"
+        return None
+
+    def _draw_field_tag(self, anchor_rect: Optional[pygame.Rect], kind: Optional[str], label: Optional[str] = None) -> None:
+        """Draw a small provenance pill to the right of a label/tooltip icon."""
+        if not kind or anchor_rect is None:
+            return
+        ui_theme.draw_tag(
+            self.screen, self.micro_font, label or kind,
+            (anchor_rect.right + 8, anchor_rect.centery - 8),
+            kind=kind, theme=self.theme,
+        )
     
+    def _draw_star_data_launcher(self):
+        """Segmented launcher row in the star customization panel for the Star Data panel."""
+        self.star_data_tab_button_rects = {}
+        if not self.star_data_panel:
+            return
+        theme = self.theme
+        panel_left = self.width - self.customization_panel_width + 50
+        field_w = self.customization_panel_width - 100
+        label_y = 525
+        label = self.tab_font.render("Stellar Data", True, self.UI_PANEL_MUTED_TEXT)
+        label_rect = label.get_rect(midleft=(panel_left, label_y))
+        self.screen.blit(label, label_rect)
+        hint = self.micro_font.render("instrument views for this star", True, theme.text_tertiary)
+        self.screen.blit(hint, hint.get_rect(midleft=(label_rect.right + 8, label_y + 1)))
+
+        rows = (
+            (("spectrum", "Spectrum"), ("hr", "H–R"), ("evolution", "Evolution")),
+            (("hz", "HZ over time"), ("properties", "Properties")),
+        )
+        gap = 6
+        btn_h = 28
+        y = label_y + 16
+        mouse = self._mouse_pos()
+        panel_open = bool(getattr(self.star_data_panel, "visible", False))
+        for row in rows:
+            btn_w = (field_w - gap * (len(row) - 1)) // len(row)
+            for i, (tab_id, text) in enumerate(row):
+                rect = pygame.Rect(panel_left + i * (btn_w + gap), y, btn_w, btn_h)
+                self.star_data_tab_button_rects[tab_id] = rect
+                active = panel_open and self.star_data_panel.tab == tab_id
+                ui_theme.draw_button(
+                    self.screen, rect, text, self.tiny_font,
+                    kind="secondary", hover=rect.collidepoint(mouse), active=active, theme=theme,
+                )
+            y += btn_h + gap
+
+    def _draw_detection_launcher(self):
+        """Compact launcher row at the foot of the planet customization panel for the Detection panel."""
+        self.detection_tab_button_rects = {}
+        if not self.detection_panel:
+            return
+        theme = self.theme
+        panel_left = self.width - self.customization_panel_width + 50
+        field_w = self.customization_panel_width - 100
+        label_y = 763
+        label = self.micro_font.render("DETECTION", True, theme.text_tertiary)
+        label_rect = label.get_rect(midleft=(panel_left, label_y))
+        self.screen.blit(label, label_rect)
+        hint = self.micro_font.render("how would astronomers find this planet?", True, theme.text_tertiary)
+        self.screen.blit(hint, hint.get_rect(midleft=(label_rect.right + 8, label_y)))
+
+        tabs = (("rv", "Radial velocity"), ("transit", "Transit"), ("compare", "Compare"))
+        gap = 6
+        btn_w = (field_w - gap * (len(tabs) - 1)) // len(tabs)
+        btn_h = 24
+        y = label_y + 9
+        mouse = self._mouse_pos()
+        panel_open = bool(getattr(self.detection_panel, "visible", False))
+        for i, (tab_id, text) in enumerate(tabs):
+            rect = pygame.Rect(panel_left + i * (btn_w + gap), y, btn_w, btn_h)
+            self.detection_tab_button_rects[tab_id] = rect
+            active = panel_open and self.detection_panel.tab == tab_id
+            ui_theme.draw_button(
+                self.screen, rect, text, self.micro_font,
+                kind="secondary", hover=rect.collidepoint(mouse), active=active, theme=theme,
+            )
+
     def draw_reset_dropdown(self):
         """Draw the Reset View button (single action, no dropdown)."""
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self._mouse_pos()
         is_hovering = self.reset_dropdown_rect.collidepoint(mouse_pos)
-        bg_color = (75, 65, 65) if is_hovering else (60, 55, 55)
-        pygame.draw.rect(self.screen, bg_color, self.reset_dropdown_rect, border_radius=4)
-        pygame.draw.rect(self.screen, (100, 90, 90), self.reset_dropdown_rect, 1, border_radius=4)
-        label = self.tiny_font.render("Reset View", True, (220, 220, 220))
+        theme = self.theme
+        ui_theme.draw_toolbar_button(self.screen, self.reset_dropdown_rect, hover=is_hovering, theme=theme)
+        label = self.tiny_font.render("Reset View", True, theme.text_primary if is_hovering else theme.text_secondary)
         label_rect = label.get_rect(center=self.reset_dropdown_rect.center)
         self.screen.blit(label, label_rect)
     
@@ -3723,14 +3672,24 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         else:
             habit_text = f"Habitability: —"
         
-        # Use restrained green or neutral white (no glow)
-        # Slightly larger than other controls - use font (size 28) instead of subtitle_font (18)
-        text_color = (140, 200, 140)  # Muted/restrained green
-        
-        habitability_text = self.font.render(habit_text, True, text_color)
+        # Readout: quiet label, value as the only emphasized element, Earth reference always visible.
+        # Text content is unchanged; only its typography is split into label / value / reference.
+        theme = self.theme
+        label_part, _, value_part = habit_text.partition(": ")
+        label_surf = self.tiny_font.render(label_part.upper(), True, theme.text_tertiary)
+        value_surf = self.subtitle_font.render(value_part, True, theme.hab_text)
+        ref_surf = self.tiny_font.render("Earth = 100", True, theme.text_tertiary)
+        gap = theme.space_sm
+        total_w = label_surf.get_width() + gap + value_surf.get_width() + gap + ref_surf.get_width()
         top_bar_center_y = (self.top_bar_button_height + 2*self.tab_margin) // 2
-        habitability_rect = habitability_text.get_rect(center=(self.width // 2, top_bar_center_y))
-        self.screen.blit(habitability_text, habitability_rect)
+        x = self.width // 2 - total_w // 2
+        label_rect = label_surf.get_rect(midleft=(x, top_bar_center_y))
+        self.screen.blit(label_surf, label_rect)
+        value_rect = value_surf.get_rect(midleft=(label_rect.right + gap, top_bar_center_y))
+        self.screen.blit(value_surf, value_rect)
+        ref_rect = ref_surf.get_rect(midleft=(value_rect.right + gap, top_bar_center_y))
+        self.screen.blit(ref_surf, ref_rect)
+        habitability_rect = label_rect.union(value_rect).union(ref_rect)
         
         # Add tooltip icon for Habitability Index
         self.draw_tooltip_icon(habitability_rect, "Habitability Index")
@@ -3740,7 +3699,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             ci_low = habit_unc['ci_lower']
             ci_high = habit_unc['ci_upper']
             ci_text = f"95% CI: ({ci_low:.1f} – {ci_high:.1f})"
-            ci_surf = self.tiny_font.render(ci_text, True, (120, 160, 120))
+            ci_surf = self.tiny_font.render(ci_text, True, theme.hab_ci_text)
             ci_rect = ci_surf.get_rect(center=(self.width // 2, habitability_rect.bottom + 10))
             self.screen.blit(ci_surf, ci_rect)
     
@@ -3760,34 +3719,19 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         panel_y = (self.height - panel_height) // 2
         self.about_panel_rect = pygame.Rect(panel_x, panel_y, panel_width, panel_height)
         
-        # Draw semi-transparent overlay
-        overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 180))
-        self.screen.blit(overlay, (0, 0))
-        
-        # Draw shadow
-        shadow_rect = self.about_panel_rect.copy()
-        shadow_rect.move_ip(4, 4)
-        pygame.draw.rect(self.screen, (20, 20, 20, 200), shadow_rect, border_radius=10)
-        
-        # Draw main panel
-        pygame.draw.rect(self.screen, (30, 35, 45), self.about_panel_rect, border_radius=10)
-        pygame.draw.rect(self.screen, (150, 150, 150), self.about_panel_rect, 2, border_radius=10)
+        theme = self.theme
+        ui_theme.draw_modal_frame(self.screen, self.about_panel_rect, tone="neutral", theme=theme)
         
         # Close button
         close_btn_rect = pygame.Rect(self.about_panel_rect.right - 35, self.about_panel_rect.top + 10, 25, 25)
-        pygame.draw.rect(self.screen, (80, 80, 100), close_btn_rect, border_radius=3)
-        pygame.draw.line(self.screen, self.WHITE, (close_btn_rect.left + 5, close_btn_rect.top + 5), 
-                        (close_btn_rect.right - 5, close_btn_rect.bottom - 5), 2)
-        pygame.draw.line(self.screen, self.WHITE, (close_btn_rect.left + 5, close_btn_rect.bottom - 5), 
-                        (close_btn_rect.right - 5, close_btn_rect.top + 5), 2)
+        ui_theme.draw_close_x(self.screen, close_btn_rect, hover=close_btn_rect.collidepoint(self._mouse_pos()), theme=theme)
         self.about_panel_close_btn = close_btn_rect
         
         # Create scrollable surface with sufficient initial height
         # We'll render all content first, then use the final y position for scrolling
         initial_content_height = 2800  # Large enough for all content
         scroll_surface = pygame.Surface((panel_width - 20, initial_content_height), pygame.SRCALPHA)
-        scroll_surface.fill((30, 35, 45, 0))
+        scroll_surface.fill((0, 0, 0, 0))
         
         curr_y = 0  # Moved up from 20
 
@@ -3824,29 +3768,37 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         
         def render_section_header(text, y):
             """Render a section header. Returns new y position."""
-            header_surf = self.font.render(text, True, (150, 200, 255))
+            header_surf = self.subtitle_font.render(text, True, theme.text_primary)
             scroll_surface.blit(header_surf, (padding, y))
+            pygame.draw.line(scroll_surface, theme.panel_border, (padding, y + header_surf.get_height() + 6),
+                             (scroll_surface.get_width() - padding, y + header_surf.get_height() + 6), 1)
             return y + line_spacing + 15
         
         def render_bullet(text, y, indent=0):
             """Render a bullet point. Returns new y position."""
-            bullet_surf = self.tiny_font.render("•", True, self.WHITE)
+            # Content strings may carry their own leading "•"; draw exactly one marker.
+            nested = indent > 0
+            text = text.strip().lstrip("•").strip()
+            bullet_surf = self.tiny_font.render(
+                "◦" if nested else "•", True,
+                theme.text_tertiary if nested else theme.text_primary,
+            )
             scroll_surface.blit(bullet_surf, (padding + indent, y))
-            text_surf = self.tiny_font.render(text, True, (220, 220, 220))
+            text_surf = self.tiny_font.render(text, True, theme.text_secondary)
             scroll_surface.blit(text_surf, (padding + indent + 15, y))
             return y + line_spacing
         
         # 1. Title & Definition
-        title_surf = self.font.render("About", True, self.WHITE)
+        title_surf = self.font.render("About", True, theme.text_primary)
         scroll_surface.blit(title_surf, (padding, curr_y))
         curr_y += 35
         
-        curr_y = render_text("AIET (Artificial Intelligence for Extraterrestrial)", self.subtitle_font, (200, 220, 255), curr_y)
+        curr_y = render_text("AIET (Artificial Intelligence for Extraterrestrial)", self.subtitle_font, theme.text_primary, curr_y)
         curr_y += 5
-        curr_y = render_text(f"Version {AIET_VERSION}", self.tiny_font, (180, 190, 210), curr_y)
+        curr_y = render_text(f"Version {AIET_VERSION}", self.tiny_font, theme.text_tertiary, curr_y)
         curr_y += 5
         curr_y = render_text("AIET is a physics-informed, data-driven platform for exploring planetary systems and comparing planetary habitability using established astrophysical models and observational data.", 
-                            self.tiny_font, (220, 220, 220), curr_y)
+                            self.tiny_font, theme.text_secondary, curr_y)
         curr_y += section_spacing
         
         # 2. Core Physical Models Implemented
@@ -3904,10 +3856,10 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         curr_y = render_section_header("How Parameters Interact", curr_y)
         curr_y += 5
         curr_y = render_text("AIET maintains physically realistic systems by coupling parameters through established physical relationships.", 
-                            self.tiny_font, (220, 220, 220), curr_y)
+                            self.tiny_font, theme.text_secondary, curr_y)
         curr_y += 10
         curr_y = render_text("Changing one parameter (e.g., orbital distance) automatically updates dependent quantities (e.g., period). Users may override inputs, but connected parameters respond to preserve physically plausible planetary systems. No derived quantity is arbitrary; all responses follow known physics.", 
-                            self.tiny_font, (220, 220, 220), curr_y)
+                            self.tiny_font, theme.text_secondary, curr_y)
         curr_y += section_spacing
         
         # 4. Machine Learning Layer
@@ -3918,13 +3870,13 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             "Kopparapu (2013) conservative-habitable-zone features. The model was trained on "
             "~76,000 archive records (default_flag=1) with physics-informed teacher labels, not "
             "confirmed-life labels. Display index scales so Earth reference = 100.",
-            self.tiny_font, (220, 220, 220), curr_y)
+            self.tiny_font, theme.text_secondary, curr_y)
         curr_y += 10
         curr_y = render_text(
             "The ML layer is for comparison and exploration—not definitive prediction or "
             "classification of life. Outputs are constrained by physical models and provide "
             "relative, comparative habitability context only.",
-            self.tiny_font, (220, 220, 220), curr_y)
+            self.tiny_font, theme.text_secondary, curr_y)
         curr_y += 5
         curr_y = render_bullet(
             "Optional Monte Carlo uncertainty (Ctrl+Shift+U): propagated input uncertainty; not model epistemic error",
@@ -3949,7 +3901,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         curr_y = render_bullet("Results depend on assumptions, imputation, and data availability", curr_y, 0)
         curr_y += 10
         curr_y = render_text("AIET is intended for scientific exploration, education, and hypothesis building—not definitive claims about life beyond Earth.", 
-                            self.tiny_font, (200, 200, 200), curr_y, wrap=True)
+                            self.tiny_font, theme.text_secondary, curr_y, wrap=True)
         curr_y += section_spacing
         
         # 7. Project Status
@@ -3959,7 +3911,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             "AIET is an active research and education build integrating physics, XGBoost habitability "
             "scoring, interactive visualization, diagnostics exports, and sandbox presets. Ongoing work "
             "focuses on validation, interpretability, distribution, and user-driven scientific exploration.",
-            self.tiny_font, (220, 220, 220), curr_y)
+            self.tiny_font, theme.text_secondary, curr_y)
         
         # Calculate actual content height (add padding at bottom)
         actual_content_height = curr_y + 20
@@ -3981,7 +3933,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             scrollbar_x = self.about_panel_rect.right - scrollbar_width - 5
             scrollbar_height = panel_height - 80
             scrollbar_rect = pygame.Rect(scrollbar_x, self.about_panel_rect.top + 60, scrollbar_width, scrollbar_height)
-            pygame.draw.rect(self.screen, (60, 60, 80), scrollbar_rect)
+            pygame.draw.rect(self.screen, theme.panel_elevated, scrollbar_rect, border_radius=2)
             self.about_scrollbar_rect = scrollbar_rect
             
             # Scrollbar thumb
@@ -3990,7 +3942,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             thumb_y = self.about_panel_rect.top + 60 + int((panel_height - 80 - thumb_height) * 
                                                            (self.about_panel_scroll_y / max_scroll))
             thumb_rect = pygame.Rect(scrollbar_x, thumb_y, scrollbar_width, thumb_height)
-            pygame.draw.rect(self.screen, (150, 150, 170), thumb_rect)
+            pygame.draw.rect(self.screen, theme.text_tertiary, thumb_rect, border_radius=2)
             self.about_scrollbar_thumb_rect = thumb_rect
         else:
             self.about_scrollbar_rect = None
@@ -4039,17 +3991,15 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         else:
             label_text = f"{selected_au:g} AU"
         tick_height = 4
-        label_surface = self.tiny_font.render(label_text, True, (200, 205, 215))
+        theme = self.theme
+        label_surface = self.tiny_font.render(label_text, True, theme.text_secondary)
         label_rect = label_surface.get_rect(midleft=(x_start + display_width_px + 8, y_pos))
         
-        # Draw background box (same width as time panel)
-        bg_surface = pygame.Surface(bg_rect.size, pygame.SRCALPHA)
-        bg_surface.fill((20, 25, 35, 180))
-        self.screen.blit(bg_surface, bg_rect.topleft)
-        pygame.draw.rect(self.screen, (60, 70, 90), bg_rect, 1, border_radius=4)
+        # HUD card (same width as time panel)
+        ui_theme.draw_hud_panel(self.screen, bg_rect, theme)
         
         # Draw scale bar
-        line_color = (180, 185, 195)
+        line_color = theme.text_secondary
         pygame.draw.line(self.screen, line_color, (x_start, y_pos), (x_start + display_width_px, y_pos), 1)
         pygame.draw.line(self.screen, line_color, (x_start, y_pos - tick_height), (x_start, y_pos + tick_height), 1)
         pygame.draw.line(self.screen, line_color, (x_start + display_width_px, y_pos - tick_height), (x_start + display_width_px, y_pos + tick_height), 1)
@@ -4112,50 +4062,39 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         if not self.show_export_panel:
             return
         
-        panel_width = 500
-        panel_height = 620
-        padding = 25
+        panel_width = 420
+        padding = 24
+        button_height = 40
+        button_spacing = 10
+        n_buttons = 6
+        # Size the sheet to its content: header block + button stack + bottom padding.
+        panel_height = 84 + n_buttons * button_height + (n_buttons - 1) * button_spacing + padding
         
         # Center the panel
         panel_x = (self.width - panel_width) // 2
         panel_y = (self.height - panel_height) // 2
         self.export_panel_rect = pygame.Rect(panel_x, panel_y, panel_width, panel_height)
         
-        # Draw semi-transparent overlay
-        overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 180))
-        self.screen.blit(overlay, (0, 0))
-        
-        # Draw shadow
-        shadow_rect = self.export_panel_rect.copy()
-        shadow_rect.move_ip(4, 4)
-        pygame.draw.rect(self.screen, (20, 20, 20, 200), shadow_rect, border_radius=10)
-        
-        # Draw main panel
-        pygame.draw.rect(self.screen, (30, 35, 45), self.export_panel_rect, border_radius=10)
-        pygame.draw.rect(self.screen, (150, 150, 150), self.export_panel_rect, 2, border_radius=10)
+        theme = self.theme
+        ui_theme.draw_modal_frame(self.screen, self.export_panel_rect, tone="neutral", theme=theme)
         
         # Close button
         close_btn_size = 25
         close_btn_rect = pygame.Rect(self.export_panel_rect.right - close_btn_size - 10, 
                                     self.export_panel_rect.top + 10, close_btn_size, close_btn_size)
-        pygame.draw.rect(self.screen, (80, 80, 100), close_btn_rect, border_radius=3)
-        pygame.draw.line(self.screen, self.WHITE, (close_btn_rect.left + 5, close_btn_rect.top + 5), 
-                        (close_btn_rect.right - 5, close_btn_rect.bottom - 5), 2)
-        pygame.draw.line(self.screen, self.WHITE, (close_btn_rect.left + 5, close_btn_rect.bottom - 5), 
-                        (close_btn_rect.right - 5, close_btn_rect.top + 5), 2)
+        ui_theme.draw_close_x(self.screen, close_btn_rect, hover=close_btn_rect.collidepoint(self._mouse_pos()), theme=theme)
         self.export_close_button_rect = close_btn_rect
         
         # Title
-        title_text = self.font.render("Export System Data", True, self.WHITE)
-        title_rect = title_text.get_rect(center=(self.export_panel_rect.centerx, self.export_panel_rect.top + 40))
+        title_text = self.subtitle_font.render("Export System Data", True, theme.text_primary)
+        title_rect = title_text.get_rect(topleft=(self.export_panel_rect.left + padding, self.export_panel_rect.top + padding))
         self.screen.blit(title_text, title_rect)
+        subtitle = self.tiny_font.render("Files are written to the exports folder.", True, theme.text_tertiary)
+        self.screen.blit(subtitle, (self.export_panel_rect.left + padding, title_rect.bottom + 4))
         
-        # Export buttons
-        button_width = 200
-        button_height = 40
-        button_spacing = 15
-        start_y = self.export_panel_rect.top + 80
+        # Export buttons: full content width so labels never truncate.
+        button_width = panel_width - 2 * padding
+        start_y = self.export_panel_rect.top + 84
         
         buttons = [
             ("Mission Data Table", "table_chart"),
@@ -4187,25 +4126,18 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             btn_y = start_y + i * (button_height + button_spacing)
             btn_rect = pygame.Rect(self.export_panel_rect.centerx - button_width // 2, btn_y, button_width, button_height)
             
-            mouse_pos = pygame.mouse.get_pos()
+            mouse_pos = self._mouse_pos()
             is_hovering = btn_rect.collidepoint(mouse_pos)
             
-            # Button color based on hover
-            if is_hovering:
-                btn_color = (100, 150, 100)
-            else:
-                btn_color = (80, 120, 80)
-            
-            pygame.draw.rect(self.screen, btn_color, btn_rect, border_radius=5)
-            pygame.draw.rect(self.screen, (200, 200, 200), btn_rect, 2, border_radius=5)
-            
-            # Keep labels inside the button width (research-friendly but compact).
-            label_font = self.tiny_font
-            max_label_width = button_width - 18
+            # Keep labels inside the button width (defensive; buttons are now full width).
+            label_font = self.subtitle_font
+            max_label_width = button_width - 24
             label = _truncate_to_width(label_font, label, max_label_width)
-            btn_text = label_font.render(label, True, self.WHITE)
-            btn_text_rect = btn_text.get_rect(center=btn_rect.center)
-            self.screen.blit(btn_text, btn_text_rect)
+            ui_theme.draw_button(
+                self.screen, btn_rect, label, label_font,
+                kind="primary" if export_type == "all" else "secondary",
+                hover=is_hovering, theme=theme,
+            )
             
             # Store rects for click detection
             if export_type == "all":
@@ -6026,21 +5958,6 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         # cause the star to shrink visually; users should zoom out instead.
         visual_radius = SUN_RADIUS_PX * (stellar_radius_solar ** STAR_RADIUS_SCALE_POWER)
 
-        # Small red dwarfs (e.g., TRAPPIST-1) can become visually smaller than their
-        # Earth-sized planets due to the star-only perceptual compression above.
-        # For stars smaller than the Sun, also compute a planet-style perceptual radius
-        # in Earth radii and use the larger of the two so the star remains visually
-        # dominant (star > planet) without changing Sun-like star sizing.
-        # Skip this alternate path for Alpha Centauri: it inflates Proxima (0.154 R☉)
-        # and B (0.86 R☉) to planet-scale disks and breaks star-vs-planet readability.
-        if stellar_radius_solar < 1.0 and getattr(self, "_current_preset", None) != "alpha_centauri":
-            try:
-                star_radius_r_earth = float(stellar_radius_solar) * float(SUN_RADIUS_R_EARTH)
-                visual_radius_alt = EARTH_RADIUS_PX * math.pow(max(0.0, star_radius_r_earth), 0.4)
-                visual_radius = max(float(visual_radius), float(visual_radius_alt))
-            except Exception:
-                pass
-        
         # Step 2: Optionally compute engulfment metadata for UI badges, but do NOT
         # modify the visual radius based on planet orbits.
         if placed_bodies is not None:
@@ -6076,19 +5993,54 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 star_body["_is_physically_engulfed"] = is_physically_engulfed
                 star_body["_is_near_engulfment"] = is_near_engulfment
                 star_body["_closest_planet_au"] = closest_planet_au
-        
-        # Alpha Centauri: tiered floors so G/K primaries read larger than the M dwarf,
-        # and all stars stay clearly bigger than any planet (see AC_PLANET_MAX_VS_STAR).
-        if getattr(self, "_current_preset", None) == "alpha_centauri":
-            name = star_body.get("name", "")
-            if name == "Proxima Centauri":
-                visual_radius = max(float(visual_radius), AC_STAR_RADIUS_FLOOR_M)
-            else:
-                visual_radius = max(float(visual_radius), AC_STAR_RADIUS_FLOOR_GK)
 
         return visual_radius
 
-    def get_visual_orbit_radius(self, semi_major_axis_au: float) -> float:
+    def _planets_orbiting_star(self, star: dict) -> List[dict]:
+        """Return all planets whose parent is the given star."""
+        star_id = star.get("id")
+        star_name = star.get("name")
+        planets: List[dict] = []
+        for body in self.placed_bodies:
+            if body.get("type") != "planet":
+                continue
+            parent_id = body.get("parent_id")
+            parent_name = body.get("parent")
+            parent_obj = body.get("parent_obj")
+            if (
+                parent_id == star_id
+                or parent_name == star_name
+                or (parent_obj and parent_obj.get("id") == star_id)
+            ):
+                planets.append(body)
+        return planets
+
+    def _refresh_orbit_visual_scales(self) -> None:
+        """
+        Per-host uniform orbit scale so the innermost planet clears the star disk.
+
+        Uses the same AU→pixel law for every system; only the multiplier differs when
+        a compact inner system would otherwise draw orbits inside the host star.
+        Preserves relative distances between all planets around that host.
+        """
+        for star in (b for b in self.placed_bodies if b.get("type") == "star"):
+            star_px = float(self.calculate_star_visual_radius(star, self.placed_bodies))
+            planets = self._planets_orbiting_star(star)
+            if not planets:
+                star["_orbit_visual_scale"] = 1.0
+                continue
+            closest_au = min(float(p.get("semiMajorAxis", 1.0)) for p in planets)
+            inner_px = AU_TO_PX * (max(0.0, closest_au) ** PLANET_DISTANCE_SCALE_POWER)
+            if inner_px <= 0:
+                star["_orbit_visual_scale"] = 1.0
+            else:
+                star["_orbit_visual_scale"] = max(
+                    1.0, (star_px + ORBIT_CLEARANCE_GAP_PX) / inner_px
+                )
+
+    def get_visual_orbit_radius(
+        self, semi_major_axis_au: float, host_star: Optional[dict] = None
+    ) -> float:
         """
         Calculate visual orbit radius in pixels using perceptual scaling.
         This matches the scaling method used for planet radii (perceptual power law).
@@ -6102,27 +6054,8 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             Visual orbit radius in pixels for rendering
         """
         a = max(0.0, float(semi_major_axis_au))
-
-        # Compact presets (notably TRAPPIST-1) have many planets within a small AU range.
-        # With a global power-law distance compression, orbit rings can become visually
-        # stacked. Apply a preset-specific *visual-only* spread multiplier so rings
-        # remain separated without changing the bodies' stored AU values/physics.
-        preset = getattr(self, "_current_preset", None)
-        if preset == "trappist_1":
-            a *= 3.0
-        elif preset == "alpha_centauri":
-            # Proxima's inner subsystem (d at 0.029 AU, b at 0.048 AU) is sub-pixel
-            # at the AC system-wide zoom level (~0.038), so the rings vanish. Pin
-            # the two inner planets to visually distinct virtual radii so all three
-            # Proxima orbits read as separate rings; Proxima c (1.48 AU) and
-            # Alpha Centauri Ab (1.50 AU) already render comfortably and are
-            # left alone. Stored semi-major-axis values (and all physics that
-            # consumes them) are unchanged -- this is rendering only, the same
-            # trade-off TRAPPIST-1 already makes above.
-            if a < 0.04:        # Proxima d
-                a = 0.45
-            elif a < 0.10:      # Proxima b
-                a = 1.00
+        if host_star is not None:
+            a *= float(host_star.get("_orbit_visual_scale", 1.0))
 
         return float(AU_TO_PX * math.pow(a, PLANET_DISTANCE_SCALE_POWER))
 
@@ -6134,19 +6067,19 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         """
         floor_au = max(float(floor_au), 1e-9)
         star_px = float(self.calculate_star_visual_radius(parent_star, None))
-        if self.get_visual_orbit_radius(floor_au) >= star_px:
+        if self.get_visual_orbit_radius(floor_au, parent_star) >= star_px:
             return floor_au
         hi = max(floor_au * 2.0, 0.05)
         guard = 0
-        while self.get_visual_orbit_radius(hi) < star_px and hi < 1.0e8 and guard < 80:
+        while self.get_visual_orbit_radius(hi, parent_star) < star_px and hi < 1.0e8 and guard < 80:
             hi *= 2.0
             guard += 1
-        if self.get_visual_orbit_radius(hi) < star_px:
+        if self.get_visual_orbit_radius(hi, parent_star) < star_px:
             return hi
         lo = floor_au
         for _ in range(80):
             mid = 0.5 * (lo + hi)
-            if self.get_visual_orbit_radius(mid) >= star_px:
+            if self.get_visual_orbit_radius(mid, parent_star) >= star_px:
                 hi = mid
             else:
                 lo = mid
@@ -6246,22 +6179,17 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             # Fallback to Sun-sized star visual radius (48px)
             star_visual_radius = SUN_RADIUS_PX
             
-        # Clamp: min=MIN_PLANET_PX, max=fraction of host star disk (tighter in α Cen so planets
-        # stay clearly smaller than stars in the triple layout). Other presets unchanged.
-        preset = getattr(self, "_current_preset", None)
-        if preset == "alpha_centauri":
-            max_vs_star = AC_PLANET_MAX_VS_STAR
-            visual_radius = max(MIN_PLANET_PX, min(visual_radius, star_visual_radius * max_vs_star))
-            # Absolute caps so gas giants (e.g. Ab at 9 R⊕) do not look star-sized.
-            is_giant = (
-                float(planet_body.get("radius", 1.0)) >= 4.0
-                or "giant" in str(planet_body.get("classification", "")).lower()
-            )
-            abs_cap = AC_PLANET_MAX_PX_GIANT if is_giant else AC_PLANET_MAX_PX_ROCKY
-            visual_radius = min(visual_radius, abs_cap)
-        else:
-            visual_radius = max(MIN_PLANET_PX, min(visual_radius, star_visual_radius * 0.85))
-        
+        # Unified clamp: planets stay clearly smaller than their host star in every system.
+        is_giant = (
+            float(planet_radius_R_earth) >= 4.0
+            or "giant" in str(planet_body.get("classification", "")).lower()
+        )
+        abs_cap = PLANET_MAX_PX_GIANT if is_giant else PLANET_MAX_PX_ROCKY
+        visual_radius = max(
+            MIN_PLANET_PX,
+            min(visual_radius, star_visual_radius * PLANET_MAX_VS_STAR, abs_cap),
+        )
+
         return visual_radius
 
     def _sync_planet_position_au(self, planet: dict, parent_star: dict, scale_px: float) -> None:
@@ -6327,27 +6255,24 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
 
     def _get_body_draw_radius_px(self, body: dict, visual_radius_world: float) -> int:
         """
-        Final on-screen draw radius (pixels) after zoom, with Alpha Centauri overrides.
+        Final on-screen draw radius (pixels) after zoom.
 
-        At the system-wide zoom level every body would otherwise shrink to 1–2 px dots
-        and stars/planets become indistinguishable. For α Cen only: stars get a screen
-        floor, planets get a screen cap relative to their host star.
+        Stars get a screen floor; planets are capped relative to their host so every
+        system stays readable when zoomed out to fit all orbits.
         """
         z = float(self.camera.zoom)
         base = max(1, int(visual_radius_world * z))
-        if getattr(self, "_current_preset", None) != "alpha_centauri":
-            return base
         btype = body.get("type")
         if btype == "star":
-            return max(AC_SCREEN_STAR_MIN_PX, base)
+            return max(SCREEN_STAR_MIN_PX, base)
         if btype == "planet":
             host = body.get("parent_obj")
             if host is not None:
                 star_world = self.calculate_star_visual_radius(host, self.placed_bodies)
-                star_screen = max(AC_SCREEN_STAR_MIN_PX, int(star_world * z))
+                star_screen = max(SCREEN_STAR_MIN_PX, int(star_world * z))
             else:
-                star_screen = AC_SCREEN_STAR_MIN_PX
-            planet_cap = max(2, int(star_screen * AC_SCREEN_PLANET_MAX_FRAC))
+                star_screen = SCREEN_STAR_MIN_PX
+            planet_cap = max(2, int(star_screen * SCREEN_PLANET_MAX_FRAC))
             return max(2, min(base, planet_cap))
         return base
     
@@ -6518,17 +6443,6 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             raise AssertionError(f"CRITICAL: Body dict identity changed during update!")
             
         return True
-
-    def update_selected_body_property(self, key, value, debug_name=""):
-        """
-        Legacy wrapper for update_selected_body_property.
-        Redirects to apply_parameter_change for physical and orbital parameters.
-        """
-        if key in ["mass", "density", "gravity", "radius", "actual_radius", "temperature", "luminosity", "semiMajorAxis", "orbital_period", "eccentricity", "greenhouse_offset"]:
-            return self.apply_parameter_change(self.selected_body_id, key, value)
-            
-        # For non-physical parameters, use the raw update
-        return self._perform_registry_update(self.selected_body_id, key, value, debug_name)
 
     def apply_parameter_change(self, body_id, parameter, value):
         """
@@ -7902,50 +7816,6 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             "star_radius_au": star_radius_au,
             "has_engulfment": len(engulfed_planets) > 0
         }
-    
-    def _perform_registry_update(self, body_id, key, value, debug_name=""):
-        """
-        Internal function to perform the actual dictionary update with all isolation checks.
-        """
-        if not body_id:
-            print(f"ERROR: Cannot update {key} - no body id provided")
-            return False
-            
-        if body_id not in self.bodies_by_id:
-            print(f"ERROR: Body id {body_id} not found in registry")
-            return False
-            
-        body = self.bodies_by_id[body_id]
-        body_dict_id_before = id(body)
-        
-        # Isolation and shared-state checks
-        if body.get("id") != body_id:
-            raise AssertionError(f"CRITICAL: Body dict id mismatch! Expected {body_id}, got {body.get('id')}")
-            
-        # Verify body dict is unique in placed_bodies
-        for other_body in self.placed_bodies:
-            if other_body.get("id") != body_id and id(other_body) == body_dict_id_before:
-                raise AssertionError(f"CRITICAL: Found shared dict for body {body_id} and {other_body.get('id')}")
-
-        # Convert value to float if it's numeric
-        if isinstance(value, (int, float)) or (hasattr(value, 'item') and not isinstance(value, str)):
-            if hasattr(value, 'item'):
-                value = float(value.item())
-            else:
-                value = float(value)
-                
-        # Perform update
-        body[key] = value
-        
-        # Mark planet or moon as modified from preset when any parameter is changed (preset reset clears this)
-        if body.get("type") in ("planet", "moon") and body.get("preset_type"):
-            body["modified_from_preset"] = True
-        
-        # Verify dict identity remains same
-        if id(body) != body_dict_id_before:
-            raise AssertionError(f"CRITICAL: Body dict identity changed during update!")
-            
-        return True
 
     def update_selected_body_property(self, key, value, debug_name=""):
         """
@@ -7953,8 +7823,12 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         This ensures we're always updating the correct object and prevents shared-state bugs.
         Automatically triggers orbit recalculation for physics-affecting parameters.
         """
-        # Call the centralized handler for physical parameters
-        if key in ["mass", "density", "gravity", "radius", "actual_radius", "temperature", "luminosity"]:
+        # Call the centralized handler for physical and orbital parameters.
+        # Orbital keys (semiMajorAxis, orbital_period, eccentricity, greenhouse_offset)
+        # must go through apply_parameter_change so Kepler coupling, stellar flux, and
+        # ML habitability rescoring all run.
+        if key in ["mass", "density", "gravity", "radius", "actual_radius", "temperature", "luminosity",
+                   "semiMajorAxis", "orbital_period", "eccentricity", "greenhouse_offset"]:
             return self.apply_parameter_change(self.selected_body_id, key, value)
             
         # For other parameters, perform direct update with isolation checks
@@ -8221,7 +8095,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         
         # Calculate correct orbital position from AU using visual scaling
         orbit_radius_au = preset.get("semiMajorAxis", 1.0)
-        orbit_radius_px = self.get_visual_orbit_radius(orbit_radius_au)
+        orbit_radius_px = self.get_visual_orbit_radius(orbit_radius_au, parent_star)
         orbit_angle = float(random.uniform(0, 2 * np.pi))
         
         # Target position based on physics (AU)
@@ -8471,7 +8345,9 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         elif obj_type == "planet":
             # Calculate position based on semi_major_axis using visual scaling
             semi_major_axis = params.get("semi_major_axis", 1.0)
-            orbit_radius_px = self.get_visual_orbit_radius(semi_major_axis)
+            stars = [b for b in self.placed_bodies if b["type"] == "star"]
+            host_star = stars[0] if len(stars) == 1 else None
+            orbit_radius_px = self.get_visual_orbit_radius(semi_major_axis, host_star)
             position = np.array([self.width/2 + orbit_radius_px, self.height/2], dtype=float)
             # Reset System / default spawn: create Earth from frozen default preset so it always
             # restores original default even if user edited SOLAR_SYSTEM_PLANET_PRESETS["Earth"]
@@ -9593,6 +9469,150 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         self._reconcile_time_scale_after_preset_change()
         self._on_preset_loaded()
 
+    def _load_kepler62_preset(self) -> None:
+        """
+        Load the Kepler-62 five-planet system preset.
+
+        Uses `get_kepler62_system()` from the physics presets module, which
+        encodes NASA Exoplanet Archive default solutions (orbital periods,
+        semi-major axes, masses, radii, equilibrium temperatures) plus
+        illustrative atmosphere labels and greenhouse offsets.
+        """
+        self.paused = True
+        self._clear_system_state()
+        self._current_preset = "kepler_62"
+
+        try:
+            specs = get_kepler62_system()
+        except Exception:
+            specs = []
+
+        type_order = {"star": 0, "planet": 1, "moon": 2}
+        specs_sorted = sorted(specs, key=lambda s: type_order.get(s.get("type", "planet"), 1))
+
+        stars_by_name: Dict[str, Any] = {}
+
+        for spec in specs_sorted:
+            body_type = spec.get("type")
+            name = spec.get("name")
+            if not body_type or not name:
+                continue
+
+            if body_type == "star":
+                self.place_object("star", {"name": name, "temperature": spec.get("temperature", 4925.0)})
+                star_body = self.placed_bodies[-1]
+
+                star_body["mass"] = float(spec.get("mass", star_body.get("mass", 1.0)))
+                star_body["radius"] = float(spec.get("radius", star_body.get("radius", 1.0)))
+                teff = float(spec.get("temperature", star_body.get("temperature", 4925.0)))
+                star_body["temperature"] = teff
+                star_body["star_temperature"] = teff
+                star_body["luminosity"] = float(spec.get("luminosity", star_body.get("luminosity", 1.0)))
+                star_body["age"] = float(spec.get("age", 7.0))
+                star_body["metallicity"] = float(spec.get("metallicity", 0.0))
+                if "spectral_class" in spec:
+                    star_body["spectral_class"] = spec["spectral_class"]
+                if "activity" in spec:
+                    star_body["activity"] = spec["activity"]
+
+                sp = getattr(self, "star_presets", {}).get(name)
+                if isinstance(sp, dict) and sp.get("base_color"):
+                    star_body["base_color"] = str(sp["base_color"])
+                    try:
+                        star_body["star_color"] = hex_to_rgb(str(sp["base_color"]))
+                    except Exception:
+                        pass
+
+                stars_by_name[name] = star_body
+
+            elif body_type == "planet":
+                host_name = spec.get("host_star")
+                host_star = stars_by_name.get(host_name) if host_name else None
+
+                semi_major_axis = float(spec.get("semi_major_axis", 0.1))
+
+                self.place_object(
+                    "planet",
+                    {
+                        "name": name,
+                        "semi_major_axis": semi_major_axis,
+                        "preset_type": spec.get("preset_type", name),
+                        "density": float(spec.get("density", 5.51)),
+                    },
+                )
+
+                planet_body = self.placed_bodies[-1]
+
+                if host_star:
+                    planet_body["parent"] = host_star.get("name")
+                    planet_body["parent_id"] = host_star.get("id")
+                    planet_body["parent_obj"] = host_star
+
+                if "mass" in spec:
+                    planet_body["mass"] = float(spec["mass"])
+                if "radius" in spec:
+                    planet_body["radius"] = float(spec["radius"])
+                planet_body["semiMajorAxis"] = semi_major_axis
+                if "orbital_period" in spec:
+                    planet_body["orbital_period"] = float(spec["orbital_period"])
+                if "eccentricity" in spec:
+                    planet_body["eccentricity"] = float(spec["eccentricity"])
+                if "stellarFlux" in spec:
+                    planet_body["stellarFlux"] = float(spec["stellarFlux"])
+                if "equilibrium_temperature" in spec:
+                    planet_body["equilibrium_temperature"] = float(spec["equilibrium_temperature"])
+                if "greenhouse_offset" in spec:
+                    planet_body["greenhouse_offset"] = float(spec["greenhouse_offset"])
+                if "temperature" in spec:
+                    planet_body["temperature"] = float(spec["temperature"])
+                if "rotation_period_days" in spec:
+                    planet_body["rotation_period_days"] = float(spec["rotation_period_days"])
+                if "classification" in spec:
+                    planet_body["classification"] = spec["classification"]
+                if "atmosphere_type" in spec:
+                    planet_body["atmosphere_type"] = spec["atmosphere_type"]
+
+                kp = getattr(self, "kepler62_planet_presets", {}).get(name)
+                if isinstance(kp, dict) and kp.get("base_color"):
+                    planet_body["base_color"] = str(kp["base_color"])
+
+        for body in self.placed_bodies:
+            self._update_derived_parameters(body)
+            if body["type"] == "planet":
+                self._update_stellar_flux(body)
+                old_selected = self.selected_body
+                self.selected_body = body
+                self._update_planet_scores()
+                self.selected_body = old_selected
+
+        if self.placed_bodies:
+            self.initialize_all_orbits()
+
+        kepler_star = next(
+            (b for b in self.placed_bodies if b.get("type") == "star" and b.get("name") == "Kepler-62"),
+            None,
+        )
+        self.reset_camera()
+
+        self.camera.camera_focus["active"] = False
+        self.camera.camera_focus["target_body_id"] = None
+        self.camera.camera_focus["target_world_pos"] = None
+        self.camera.camera_focus["target_zoom"] = None
+
+        if self.placed_bodies:
+            self.show_simulation_builder = False
+            self.show_simulation = True
+
+        if kepler_star:
+            self.selected_body_id = kepler_star.get("id")
+            self.selected_body = kepler_star
+
+        self._current_preset = "kepler_62"
+        self.current_scale_index = DEFAULT_SCALE_INDEX
+        self.last_pre_pause_scale_index = DEFAULT_SCALE_INDEX
+        self._reconcile_time_scale_after_preset_change()
+        self._on_preset_loaded()
+
     def _clear_system_state(self) -> None:
         """Helper to clear all bodies, caches, and related UI state."""
         self.placed_bodies.clear()
@@ -9922,43 +9942,47 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         
         # Position panel relative to info icon
         self.info_panel_rect = pygame.Rect(self.width - panel_width - 50, 50, panel_width, panel_height)
+        theme = self.theme
         
-        # Draw shadow
-        shadow_rect = self.info_panel_rect.copy()
-        shadow_rect.move_ip(4, 4)
-        pygame.draw.rect(self.screen, (20, 20, 20, 100), shadow_rect, border_radius=10)
+        # Floating card (no scrim: this is a popover, not a modal)
+        ui_theme.draw_modal_frame(self.screen, self.info_panel_rect, tone="neutral", scrim=False, theme=theme)
         
-        # Draw main panel
-        pygame.draw.rect(self.screen, (40, 40, 60), self.info_panel_rect, border_radius=10)
-        pygame.draw.rect(self.screen, self.WHITE, self.info_panel_rect, 2, border_radius=10)
-        
-        # Draw Title
-        title_surf = self.font.render("Derived Physics", True, self.WHITE)
-        title_rect = title_surf.get_rect(midtop=(self.info_panel_rect.centerx, self.info_panel_rect.top + 15))
+        # Title + provenance tag: everything here is computed from inputs
+        title_surf = self.subtitle_font.render("Derived Physics", True, theme.text_primary)
+        title_rect = title_surf.get_rect(midleft=(self.info_panel_rect.left + padding, self.info_panel_rect.top + 26))
         self.screen.blit(title_surf, title_rect)
+        ui_theme.draw_tag(
+            self.screen, self.micro_font, "derived", (title_rect.right + 8, title_rect.centery - 8),
+            kind="measured", theme=theme,
+        )
         
         # Close button X
         self.info_panel_close_btn = pygame.Rect(self.info_panel_rect.right - 30, self.info_panel_rect.top + 10, 20, 20)
-        pygame.draw.line(self.screen, self.WHITE, (self.info_panel_close_btn.left, self.info_panel_close_btn.top), (self.info_panel_close_btn.right, self.info_panel_close_btn.bottom), 2)
-        pygame.draw.line(self.screen, self.WHITE, (self.info_panel_close_btn.left, self.info_panel_close_btn.bottom), (self.info_panel_close_btn.right, self.info_panel_close_btn.top), 2)
+        ui_theme.draw_close_x(
+            self.screen, self.info_panel_close_btn,
+            hover=self.info_panel_close_btn.collidepoint(self._mouse_pos()), theme=theme,
+        )
 
         curr_y = self.info_panel_rect.top + 60
         
         def draw_section_header(text, y):
-            header = self.subtitle_font.render(text, True, (150, 200, 255))
-            self.screen.blit(header, (self.info_panel_rect.left + padding, y))
+            ui_theme.draw_section_label(self.screen, self.micro_font, text, (self.info_panel_rect.left + padding, y), theme=theme)
+            ui_theme.divider(self.screen, self.info_panel_rect.left + padding, y + 16, panel_width - 2 * padding, theme)
             return y + 25
 
-        def draw_stat(label, value, y, unit="", tooltip_param=None):
-            label_surf = self.tiny_font.render(label, True, (200, 200, 200))
+        def draw_stat(label, value, y, unit="", tooltip_param=None, provenance=None):
+            label_surf = self.tiny_font.render(label, True, theme.text_secondary)
             label_rect = label_surf.get_rect(midleft=(self.info_panel_rect.left + padding, y))
             self.screen.blit(label_surf, label_rect)
             # Add tooltip icon if specified
+            anchor = label_rect
             if tooltip_param:
-                self.draw_tooltip_icon(label_rect, tooltip_param)
+                anchor = self.draw_tooltip_icon(label_rect, tooltip_param) or label_rect
+            if provenance:
+                self._draw_field_tag(anchor, provenance, provenance)
             val_text = f"{value} {unit}" if unit else str(value)
-            val_surf = self.tiny_font.render(val_text, True, self.WHITE)
-            self.screen.blit(val_surf, (self.info_panel_rect.right - padding - val_surf.get_width(), y))
+            val_surf = self.tiny_font.render(val_text, True, theme.text_primary)
+            self.screen.blit(val_surf, val_surf.get_rect(midright=(self.info_panel_rect.right - padding, y)))
             return y + 20
 
         if body.get("type") == "planet" or body.get("type") == "moon":
@@ -9968,8 +9992,8 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             curr_y = draw_stat("Axial Stability:", stability, curr_y)
             # Small explanation for stability
             expl = "Stable tilt" if stability == "Stable" else "Chaotic variation" if stability == "Chaotic" else "No axial tilt"
-            expl_surf = self.tiny_font.render(f"({expl})", True, (150, 150, 150))
-            self.screen.blit(expl_surf, (self.info_panel_rect.left + padding + 10, curr_y))
+            expl_surf = self.tiny_font.render(f"({expl})", True, theme.text_tertiary)
+            self.screen.blit(expl_surf, expl_surf.get_rect(midleft=(self.info_panel_rect.left + padding + 10, curr_y)))
             curr_y += 20
             
             flux_var = body.get("seasonal_flux_variation", 0.0)
@@ -9982,27 +10006,27 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             curr_y = draw_stat("Seasonal Contrast:", "", curr_y)
             contrast = body.get("seasonal_contrast_score", 0.5)
             bar_rect = pygame.Rect(self.info_panel_rect.left + padding, curr_y, panel_width - 2*padding, 10)
-            pygame.draw.rect(self.screen, (60, 60, 80), bar_rect)
+            pygame.draw.rect(self.screen, theme.panel_elevated, bar_rect, border_radius=3)
             contrast_rect = pygame.Rect(bar_rect.left, bar_rect.top, int(bar_rect.width * contrast), bar_rect.height)
-            pygame.draw.rect(self.screen, (255, 100, 100), contrast_rect)
+            pygame.draw.rect(self.screen, theme.warning_soft, contrast_rect, border_radius=3)
             curr_y += 30
 
             # --- Thermal Breakdown ---
             curr_y = draw_section_header("Thermal Breakdown", curr_y)
             t_eq = body.get("equilibrium_temperature", 255.0)
             # Draw Equilibrium Temperature with tooltip icon
-            eq_temp_label = self.tiny_font.render("Equilibrium Temp:", True, (200, 200, 200))
+            eq_temp_label = self.tiny_font.render("Equilibrium Temp:", True, theme.text_secondary)
             eq_temp_label_rect = eq_temp_label.get_rect(midleft=(self.info_panel_rect.left + padding, curr_y))
             self.screen.blit(eq_temp_label, eq_temp_label_rect)
             # Add tooltip icon
             self.draw_tooltip_icon(eq_temp_label_rect, "Equilibrium Temperature")
             val_text = f"{t_eq:.1f} K"
-            val_surf = self.tiny_font.render(val_text, True, self.WHITE)
-            self.screen.blit(val_surf, (self.info_panel_rect.right - padding - val_surf.get_width(), curr_y))
+            val_surf = self.tiny_font.render(val_text, True, theme.text_primary)
+            self.screen.blit(val_surf, val_surf.get_rect(midright=(self.info_panel_rect.right - padding, curr_y)))
             curr_y += 20
             
             greenhouse = body.get("greenhouse_offset", 0.0)
-            curr_y = draw_stat("Greenhouse Effect:", f"+{greenhouse:.1f}", curr_y, "K")
+            curr_y = draw_stat("Greenhouse Effect:", f"+{greenhouse:.1f}", curr_y, "K", provenance="assumed")
             
             tidal = body.get("tidal_heating_delta", 0.0)
             curr_y = draw_stat("Tidal Heating:", f"+{tidal:.1f}", curr_y, "K")
@@ -10030,8 +10054,8 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             curr_y = draw_stat("Erosion Status:", erosion, curr_y)
             # Small explanation for erosion
             expl = "Atmosphere is protected" if erosion == "Stable" else "Losing atmosphere slowly" if erosion == "Slowly Eroding" else "Atmosphere being stripped"
-            expl_surf = self.tiny_font.render(f"({expl})", True, (150, 150, 150))
-            self.screen.blit(expl_surf, (self.info_panel_rect.left + padding + 10, curr_y))
+            expl_surf = self.tiny_font.render(f"({expl})", True, theme.text_tertiary)
+            self.screen.blit(expl_surf, expl_surf.get_rect(midleft=(self.info_panel_rect.left + padding + 10, curr_y)))
             curr_y += 20
             
             # Moon-specific: Hill Sphere with tooltip
@@ -10064,14 +10088,100 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                     curr_y = draw_stat("Habitable Zone:", hz_status, curr_y, tooltip_param="Habitable Zone")
                     curr_y += 10
 
+    def _update_viewport(self) -> None:
+        """Map the fixed logical frame onto the current display with uniform scale."""
+        display_w, display_h = self._display.get_size()
+        if display_w <= 0 or display_h <= 0:
+            return
+        scale = min(display_w / self.width, display_h / self.height)
+        scaled_w = max(1, int(round(self.width * scale)))
+        scaled_h = max(1, int(round(self.height * scale)))
+        offset_x = (display_w - scaled_w) // 2
+        offset_y = (display_h - scaled_h) // 2
+        self._viewport = pygame.Rect(offset_x, offset_y, scaled_w, scaled_h)
+
+    def _display_to_logical(self, pos) -> tuple[int, int]:
+        """Convert OS-window mouse coordinates to logical 1200×800 space."""
+        x, y = pos
+        if self._viewport.width <= 0 or self._viewport.height <= 0:
+            return int(x), int(y)
+        x = max(self._viewport.left, min(x, self._viewport.right - 1))
+        y = max(self._viewport.top, min(y, self._viewport.bottom - 1))
+        lx = (x - self._viewport.x) * self.width / self._viewport.width
+        ly = (y - self._viewport.y) * self.height / self._viewport.height
+        return int(lx), int(ly)
+
+    def _mouse_pos(self) -> tuple[int, int]:
+        return self._display_to_logical(pygame.mouse.get_pos())
+
+    def _normalize_input_event(self, event) -> None:
+        if not hasattr(event, "pos"):
+            return
+        if event.type == pygame.MOUSEMOTION and hasattr(event, "rel"):
+            if self._viewport.width > 0:
+                scale = self.width / self._viewport.width
+                event.rel = (int(event.rel[0] * scale), int(event.rel[1] * scale))
+        event.pos = self._display_to_logical(event.pos)
+
+    def _on_video_resize(self, size) -> None:
+        if self._is_fullscreen:
+            return
+        w = max(self._min_display_width, int(size[0]))
+        h = max(self._min_display_height, int(size[1]))
+        self._windowed_size = (w, h)
+        self._display = pygame.display.set_mode(self._windowed_size, pygame.RESIZABLE)
+        self._update_viewport()
+
+    def _toggle_fullscreen(self) -> None:
+        if self._is_fullscreen:
+            self._display = pygame.display.set_mode(self._windowed_size, pygame.RESIZABLE)
+            self._is_fullscreen = False
+        else:
+            self._windowed_size = self._display.get_size()
+            desktop = pygame.display.Info()
+            self._display = pygame.display.set_mode(
+                (desktop.current_w, desktop.current_h),
+                pygame.FULLSCREEN,
+            )
+            self._is_fullscreen = True
+        self._update_viewport()
+
+    def _present_frame(self) -> None:
+        self._update_viewport()
+        self._display.fill((0, 0, 0))
+        if self._viewport.width > 0 and self._viewport.height > 0:
+            scaled = pygame.transform.smoothscale(
+                self.screen, (self._viewport.width, self._viewport.height)
+            )
+            self._display.blit(scaled, self._viewport.topleft)
+        pygame.display.flip()
+
     def handle_events(self) -> bool:
         """Handle pygame events. Returns False if the window should close."""
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return False
+
+            if event.type == pygame.VIDEORESIZE and not self._is_fullscreen:
+                self._on_video_resize(event.size)
+                continue
+
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_F11:
+                self._toggle_fullscreen()
+                continue
+
+            self._normalize_input_event(event)
             
             # --- SCIENTIFIC DIAGNOSTICS PANEL EVENT HANDLING ---
             if self.diagnostics_panel and self.diagnostics_panel.handle_event(event):
+                continue
+
+            # --- STAR DATA PANEL EVENT HANDLING (launcher buttons + tabbed panel) ---
+            if self.star_data_panel and self.star_data_panel.handle_event(event):
+                continue
+
+            # --- DETECTION PANEL EVENT HANDLING (planet launcher buttons + tabbed panel) ---
+            if self.detection_panel and self.detection_panel.handle_event(event):
                 continue
             
             # --- ENGULFMENT CONFIRMATION MODAL EVENT HANDLING (BLOCKS OTHER INPUT) ---
@@ -10329,7 +10439,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                     continue
                 # Handle scrolling
                 if event.type == pygame.MOUSEWHEEL:
-                    if hasattr(self, 'about_panel_rect') and self.about_panel_rect.collidepoint(pygame.mouse.get_pos()):
+                    if hasattr(self, 'about_panel_rect') and self.about_panel_rect.collidepoint(self._mouse_pos()):
                         max_scroll = max(0, int(getattr(self, "_about_content_height", 0)) - (self.about_panel_rect.height - 80))
                         self.about_panel_scroll_y = max(0, min(max_scroll, self.about_panel_scroll_y - event.y * 30))
                         continue
@@ -10540,6 +10650,8 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                             self._load_solar_system_preset()
                         elif self.system_menu_pending_preset == "trappist_1":
                             self._load_trappist1_preset()
+                        elif self.system_menu_pending_preset == "kepler_62":
+                            self._load_kepler62_preset()
                         elif self.system_menu_pending_preset == "alpha_centauri":
                             self._load_alpha_centauri_preset()
                         self.system_menu_confirm_modal = False
@@ -10579,6 +10691,8 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                             self._load_solar_system_preset()
                         elif self.system_menu_pending_preset == "trappist_1":
                             self._load_trappist1_preset()
+                        elif self.system_menu_pending_preset == "kepler_62":
+                            self._load_kepler62_preset()
                         elif self.system_menu_pending_preset == "alpha_centauri":
                             self._load_alpha_centauri_preset()
                         self.system_menu_confirm_modal = False
@@ -10844,7 +10958,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                                 radius_re = 1.0
                             visual_radius = EARTH_RADIUS_PX * math.pow(radius_re, 0.4)
                             self.preview_radius = int(max(MIN_PLANET_PX, min(visual_radius, SUN_RADIUS_PX * 0.85)))
-                            self.preview_position = pygame.mouse.get_pos()
+                            self.preview_position = self._mouse_pos()
                             self.placement_mode_active = True
                             # Close the Custom Objects panel but leave Add Body dropdown logic intact.
                             self.object_library_visible = False
@@ -11064,7 +11178,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 # Cancel focus mode on manual zoom
                 self.camera.camera_focus["active"] = False
                 
-                mouse_x, mouse_y = pygame.mouse.get_pos()
+                mouse_x, mouse_y = self._mouse_pos()
                 world_before = self.screen_to_world((mouse_x, mouse_y))
                 if event.y > 0:
                     self.camera.zoom *= 1.1
@@ -11296,7 +11410,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                                                 else:
                                                     self.preview_radius = int(MIN_PLANET_PX)  # New minimum Earth size
                                                 # Initialize preview position immediately at mouse cursor
-                                                self.preview_position = pygame.mouse.get_pos()
+                                                self.preview_position = self._mouse_pos()
                                                 # Activate placement mode - preview position will be updated every frame
                                                 self.placement_mode_active = True
                                         # Keep dropdown open to show selection, but recreate surface to show highlight
@@ -12981,7 +13095,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                                         else:
                                             self.preview_radius = int(MIN_PLANET_PX)  # New minimum Earth size
                                         # Initialize preview position immediately at mouse cursor
-                                        self.preview_position = pygame.mouse.get_pos()
+                                        self.preview_position = self._mouse_pos()
                                         # Activate placement mode - preview position will be updated every frame
                                         self.placement_mode_active = True
                                     # Keep dropdown open to show selection (will be highlighted on next render)
@@ -13036,7 +13150,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                                         if tab_name in ["star", "moon"]:
                                             self.start_placement_mode(tab_name)
                                             # Initialize preview position immediately at mouse cursor
-                                            self.preview_position = pygame.mouse.get_pos()
+                                            self.preview_position = self._mouse_pos()
                                     # Clear selected body when changing tabs
                                     self.selected_body = None
                                     self.selected_body_id = None
@@ -14032,7 +14146,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                                         stellar_radius_au = float(parent_star.get("radius", 1.0)) * RSUN_TO_AU
                                         planet_semi_major_axis_au = float(body.get("semiMajorAxis", 1.0))
                                         physical = stellar_radius_au >= planet_semi_major_axis_au
-                                        orbit_px = float(self.get_visual_orbit_radius(planet_semi_major_axis_au))
+                                        orbit_px = float(self.get_visual_orbit_radius(planet_semi_major_axis_au, parent_star))
                                         star_disk_px = float(self.calculate_star_visual_radius(parent_star, None))
                                         visual = orbit_px < star_disk_px
                                         
@@ -14705,7 +14819,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                         self.planet_density_input_text += event.unicode
             elif event.type == pygame.MOUSEMOTION:
                 # DO NOT update preview_position here - it causes freezing!
-                # Preview position is updated every frame in render loop using pygame.mouse.get_pos()
+                # Preview position is updated every frame in render loop using self._mouse_pos()
                 # This ensures smooth, frame-accurate tracking regardless of event timing
                 pass
         return True
@@ -14835,6 +14949,8 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                         planet_names = list(SOLAR_SYSTEM_PLANET_PRESETS.keys())
                     elif self.planets_family_selected == "TRAPPIST-1":
                         planet_names = list(getattr(self, "trappist1_planet_presets", {}).keys())
+                    elif self.planets_family_selected == "Kepler-62":
+                        planet_names = list(getattr(self, "kepler62_planet_presets", {}).keys())
                     else:
                         planet_names = list(getattr(self, "alpha_centauri_planet_presets", {}).keys())
 
@@ -14863,6 +14979,8 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                                 base = dict(SOLAR_SYSTEM_PLANET_PRESETS.get("Earth", {}))
                                 if self.planets_family_selected == "TRAPPIST-1":
                                     t = getattr(self, "trappist1_planet_presets", {}).get(pname, {})
+                                elif self.planets_family_selected == "Kepler-62":
+                                    t = getattr(self, "kepler62_planet_presets", {}).get(pname, {})
                                 else:
                                     t = getattr(self, "alpha_centauri_planet_presets", {}).get(pname, {})
                                 base.update(
@@ -14877,9 +14995,18 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                                 self.planet_preset_pending_dict = base
                                 planet_radius_re = base.get("radius", 1.0)
                                 visual_radius = EARTH_RADIUS_PX * math.pow(float(planet_radius_re), 0.4)
-                                self.preview_radius = int(max(MIN_PLANET_PX, min(visual_radius, SUN_RADIUS_PX * 0.85)))
+                                star_px = SUN_RADIUS_PX
+                                if stars := [b for b in self.placed_bodies if b.get("type") == "star"]:
+                                    star_px = self.calculate_star_visual_radius(stars[0], self.placed_bodies)
+                                is_giant = float(planet_radius_re) >= 4.0
+                                abs_cap = PLANET_MAX_PX_GIANT if is_giant else PLANET_MAX_PX_ROCKY
+                                visual_radius = max(
+                                    MIN_PLANET_PX,
+                                    min(visual_radius, star_px * PLANET_MAX_VS_STAR, abs_cap),
+                                )
+                                self.preview_radius = int(visual_radius)
 
-                            self.preview_position = pygame.mouse.get_pos()
+                            self.preview_position = self._mouse_pos()
 
                         # Close menus after picking a planet
                         self.add_body_dropdown_visible = False
@@ -14914,7 +15041,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                             self.star_preset_pending_dict = dict(getattr(self, "star_presets", {}).get(fam, {})) or None
                             self.active_tab = "star"
                             self.placement_mode_active = True
-                            self.preview_position = pygame.mouse.get_pos()
+                            self.preview_position = self._mouse_pos()
                             # Preview radius based on solar-radii style scaling
                             try:
                                 r_solar = float((self.star_preset_pending_dict or {}).get("radius", 1.0))
@@ -14942,7 +15069,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                         self.star_preset_pending_dict = dict(getattr(self, "star_presets", {}).get(sname, {})) or None
                         self.active_tab = "star"
                         self.placement_mode_active = True
-                        self.preview_position = pygame.mouse.get_pos()
+                        self.preview_position = self._mouse_pos()
                         try:
                             r_solar = float((self.star_preset_pending_dict or {}).get("radius", 1.0))
                         except Exception:
@@ -14980,7 +15107,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                                 self.preview_radius = int(max(MIN_PLANET_PX, min(visual_radius, SUN_RADIUS_PX * 0.85)))
                             else:
                                 self.preview_radius = int(MIN_PLANET_PX)
-                            self.preview_position = pygame.mouse.get_pos()
+                            self.preview_position = self._mouse_pos()
                             self.placement_mode_active = True
                         # Close both dropdowns after selection
                         self.add_body_dropdown_visible = False
@@ -15034,6 +15161,9 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                             self.system_menu_confirm_modal = True
                         elif option.startswith("TRAPPIST-1"):
                             self.system_menu_pending_preset = "trappist_1"
+                            self.system_menu_confirm_modal = True
+                        elif option.startswith("Kepler-62"):
+                            self.system_menu_pending_preset = "kepler_62"
                             self.system_menu_confirm_modal = True
                         elif option.startswith("Alpha Centauri"):
                             self.system_menu_pending_preset = "alpha_centauri"
@@ -15144,6 +15274,9 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                             elif option.startswith("TRAPPIST-1"):
                                 self.system_menu_pending_preset = "trappist_1"
                                 self.system_menu_confirm_modal = True
+                            elif option.startswith("Kepler-62"):
+                                self.system_menu_pending_preset = "kepler_62"
+                                self.system_menu_confirm_modal = True
                             elif option.startswith("Alpha Centauri"):
                                 self.system_menu_pending_preset = "alpha_centauri"
                                 self.system_menu_confirm_modal = True
@@ -15229,7 +15362,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 self.active_tab = body_type
                 # Activate placement mode for stars and moons
                 self.start_placement_mode(body_type)
-                self.preview_position = pygame.mouse.get_pos()
+                self.preview_position = self._mouse_pos()
             
             # Clear selected body when changing tabs
             self.selected_body = None
@@ -15546,14 +15679,14 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         
         # Choose color based on body type
         if body["type"] == "planet":
-            color = self.GRAY
+            color = self.theme.orbit_trail
         elif body["type"] == "star":
-            color = (160, 155, 130)  # Warm gray for star trails (N-body)
+            color = self.theme.star_trail  # Warm gray for star trails (N-body)
         else:  # moon
-            color = (100, 100, 100)  # Slightly darker for moons
+            color = self.theme.orbit_ring_moon
         
         # Draw the orbit line
-        pygame.draw.lines(self.screen, color, False, pts, max(1, int(2 * self.camera.zoom)))
+        pygame.draw.lines(self.screen, color, False, pts, max(1, int(1.5 * self.camera.zoom)))
     
     def compute_planet_position(self, planet, parent_star):
         """
@@ -15572,7 +15705,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         
         # Apply perceptual scaling to AU distance (a)
         semi_major_axis_au = planet.get("semiMajorAxis", 1.0)
-        a = self.get_visual_orbit_radius(semi_major_axis_au)
+        a = self.get_visual_orbit_radius(semi_major_axis_au, parent_star)
         e = float(planet.get("eccentricity", 0.0))
         theta = float(planet.get("orbit_angle", 0.0))
         
@@ -15733,6 +15866,9 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                     body["semiMajorAxis"] = float(new_au)
         except (ValueError, ZeroDivisionError, OverflowError):
             pass
+
+        if body.get("type") == "planet":
+            self._refresh_orbit_visual_scales()
             
         # Ensure stellar flux is updated whenever orbital parameters change
         self._update_stellar_flux(body)
@@ -15746,7 +15882,8 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         if parent_obj:
             # Calculate new target position based on updated AU
             if body["type"] == "planet":
-                new_orbit_radius_px = self.get_visual_orbit_radius(new_au)
+                host = parent_obj if parent_obj.get("type") == "star" else None
+                new_orbit_radius_px = self.get_visual_orbit_radius(new_au, host)
             elif body["type"] == "moon":
                 new_orbit_radius_px = self.get_visual_moon_orbit_radius(new_au)
             else:
@@ -15818,7 +15955,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         if body["type"] == "planet":
             # For planets: orbit_radius uses perceptual sqrt scaling
             semi_major_axis = body.get("semiMajorAxis", 1.0)
-            orbit_radius = self.get_visual_orbit_radius(semi_major_axis)
+            orbit_radius = self.get_visual_orbit_radius(semi_major_axis, parent)
             body["orbit_radius"] = float(orbit_radius)
             
             # Ensure eccentricity is set (default to Earth-like 0.0167 or 0.0)
@@ -15978,7 +16115,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             # PHYSICS CONTRACT: The visual orbit radius is always a direct function of a_AU; we never
             # move the orbit outward for rendering. Engulfment is handled via explicit state/modals.
             if body["type"] == "planet":
-                orbit_radius = self.get_visual_orbit_radius(body.get("semiMajorAxis", 1.0))
+                orbit_radius = self.get_visual_orbit_radius(body.get("semiMajorAxis", 1.0), parent)
             elif body["type"] == "moon" and body.get("semiMajorAxis"):
                 orbit_radius = self.get_visual_moon_orbit_radius(body["semiMajorAxis"])
             else:
@@ -16009,6 +16146,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
     
     def initialize_all_orbits(self):
         """Initialize orbital relationships and velocities for all bodies when simulation starts"""
+        self._refresh_orbit_visual_scales()
         for body in self.placed_bodies:
             if body["type"] == "planet" and not body["parent"]:
                 # Find nearest star
@@ -16437,7 +16575,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                     
                     # CRITICAL: For planets and moons, orbit_radius is derived from semiMajorAxis via visual scaling
                     if body["type"] == "planet":
-                        orbit_radius = self.get_visual_orbit_radius(body.get("semiMajorAxis", 1.0))
+                        orbit_radius = self.get_visual_orbit_radius(body.get("semiMajorAxis", 1.0), parent)
                         body["orbit_radius"] = float(orbit_radius)
                     elif body["type"] == "moon" and body.get("semiMajorAxis"):
                         orbit_radius = self.get_visual_moon_orbit_radius(body["semiMajorAxis"])
@@ -16453,7 +16591,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                         self.generate_orbit_grid(body)
                         # Re-get values after regeneration
                         if body["type"] == "planet":
-                            orbit_radius = self.get_visual_orbit_radius(body.get("semiMajorAxis", 1.0))
+                            orbit_radius = self.get_visual_orbit_radius(body.get("semiMajorAxis", 1.0), parent)
                         else:
                             orbit_radius = body.get("orbit_radius", 0.0)
                         orbit_speed = body.get("orbit_speed", 0.0)
@@ -16830,29 +16968,22 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         # Calculate the right boundary based on whether customization panel is visible
         right_boundary = self.width - self.customization_panel_width if self.show_customization_panel else self.width
         
+        major = self.theme.canvas_grid
+        minor = self.theme.canvas_grid_fine
+        
         # Draw horizontal lines
         for y in range(space_top, self.height, self.grid_size):
-            # Draw main lines
-            pygame.draw.line(self.screen, self.GRID_COLOR, 
-                            (0, y), 
-                            (right_boundary, y), 1)
-            
-            # Draw secondary lines (darker)
+            pygame.draw.line(self.screen, major, (0, y), (right_boundary, y), 1)
             if y + self.grid_size//2 < self.height:
-                pygame.draw.line(self.screen, (self.GRID_COLOR[0]//2, self.GRID_COLOR[1]//2, self.GRID_COLOR[2]//2), 
+                pygame.draw.line(self.screen, minor,
                                 (0, y + self.grid_size//2), 
                                 (right_boundary, y + self.grid_size//2), 1)
         
         # Draw vertical lines
         for x in range(0, right_boundary, self.grid_size):
-            # Draw main lines
-            pygame.draw.line(self.screen, self.GRID_COLOR, 
-                            (x, space_top), 
-                            (x, self.height), 1)
-            
-            # Draw secondary lines (darker)
+            pygame.draw.line(self.screen, major, (x, space_top), (x, self.height), 1)
             if x + self.grid_size//2 < right_boundary:
-                pygame.draw.line(self.screen, (self.GRID_COLOR[0]//2, self.GRID_COLOR[1]//2, self.GRID_COLOR[2]//2), 
+                pygame.draw.line(self.screen, minor,
                                 (x + self.grid_size//2, space_top), 
                                 (x + self.grid_size//2, self.height), 1)
     
@@ -17594,7 +17725,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                                 self.preview_radius = int(max(MIN_PLANET_PX, min(visual_radius, SUN_RADIUS_PX * 0.85)))
                             else:
                                 self.preview_radius = int(MIN_PLANET_PX)
-                            self.preview_position = pygame.mouse.get_pos()
+                            self.preview_position = self._mouse_pos()
                             self.placement_mode_active = True
                     self.create_dropdown_surface()
                     return True
@@ -18342,7 +18473,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         pygame.draw.rect(self.screen, (25, 30, 40), menu_bg_rect, border_radius=4)
         pygame.draw.rect(self.screen, (80, 90, 110), menu_bg_rect, 1, border_radius=4)
         
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self._mouse_pos()
         
         # Draw preset options
         for i, preset_name in enumerate(self.planet_preset_options):
@@ -18397,9 +18528,13 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                     if len(screen_points) < 2:
                         continue
                     if body["type"] == "planet":
-                        color = self.LIGHT_GRAY
+                        color = self.theme.orbit_ring
                     else:  # moon
-                        color = (150, 150, 150)  # Slightly darker for moons
+                        color = self.theme.orbit_ring_moon
+                    # Selected body's reference orbit is emphasized so "what am I editing" is unambiguous
+                    is_selected_ring = self.selected_body is body
+                    if is_selected_ring:
+                        color = self.theme.selection_ring
                     
                     # Optional: Fade orbits with high eccentricity (> 0.6) to flag instability
                     e = float(body.get("eccentricity", 0.0))
@@ -18407,7 +18542,8 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                         fade_factor = max(0.3, 1.0 - (e - 0.6) / 0.4)
                         color = tuple(int(c * fade_factor) for c in color)
                         
-                    pygame.draw.lines(self.screen, color, True, screen_points, max(1, int(2 * self.camera.zoom)))
+                    ring_w = max(1, int((1.5 if is_selected_ring else 1.0) * self.camera.zoom))
+                    pygame.draw.lines(self.screen, color, True, screen_points, ring_w)
 
         # N-body reference rings for stars (Alpha Centauri triple). Stars don't have
         # a single "parent" body, so we draw them as circles centered on the current
@@ -18514,7 +18650,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                                         self.screen.blit(trail_surface, (0, 0))
         
         # Compute which body is hovered (for subtle highlight and name label)
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self._mouse_pos()
         hovered_body = None
         for b in self.placed_bodies:
             if b.get("is_destroyed", False):
@@ -18574,7 +18710,21 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 else:
                     # Stars: calculate visual radius using perceptual scaling with orbit clamping
                     visual_radius = self.calculate_star_visual_radius(body, self.placed_bodies)
-                pygame.draw.circle(self.screen, self.RED, (int(pos[0]), int(pos[1])), max(1, int((visual_radius + 5) * self.camera.zoom)), 2)
+                # Selection: accent ring + soft outer halo so it never reads as an error state
+                sel_center = (int(pos[0]), int(pos[1]))
+                sel_r = max(1, int((visual_radius + 5) * self.camera.zoom))
+                halo = pygame.Surface((sel_r * 2 + 12, sel_r * 2 + 12), pygame.SRCALPHA)
+                hr, hg, hb = self.theme.selection_ring
+                pygame.draw.circle(halo, (hr, hg, hb, 48), (sel_r + 6, sel_r + 6), sel_r + 4, 4)
+                self.screen.blit(halo, (sel_center[0] - sel_r - 6, sel_center[1] - sel_r - 6))
+                pygame.draw.circle(self.screen, self.theme.selection_ring, sel_center, sel_r, 2)
+                # Persistent name label for the selected body
+                name = body.get("display_name", body.get("name", "?"))
+                label_surf = self.tiny_font.render(name, True, self.theme.text_primary)
+                label_center = (sel_center[0], sel_center[1] - sel_r - 14)
+                label_rect = label_surf.get_rect(center=label_center)
+                label_rect.clamp_ip(self.screen.get_rect().inflate(-12, -12))
+                ui_theme.draw_text_pill(self.screen, label_surf, label_rect.center, theme=self.theme)
             # Subtle hover highlight and name label when not selected
             elif hovered_body is body:
                 pos = self.world_to_screen(body["position"])
@@ -18585,21 +18735,21 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 else:
                     visual_radius = self.calculate_star_visual_radius(body, self.placed_bodies)
                 r_screen = max(1, int((visual_radius + 4) * self.camera.zoom))
-                pygame.draw.circle(self.screen, (220, 230, 240), (int(pos[0]), int(pos[1])), r_screen, 1)
+                pygame.draw.circle(self.screen, self.theme.hover_ring, (int(pos[0]), int(pos[1])), r_screen, 1)
                 name = body.get("display_name", body.get("name", "?"))
-                label_surf = self.tiny_font.render(name, True, (240, 245, 255))
-                label_rect = label_surf.get_rect(center=(int(pos[0]), int(pos[1]) - r_screen - 10))
+                label_surf = self.tiny_font.render(name, True, self.theme.text_primary)
+                label_rect = label_surf.get_rect(center=(int(pos[0]), int(pos[1]) - r_screen - 14))
                 # Keep label on screen
-                label_rect.clamp_ip(self.screen.get_rect())
-                self.screen.blit(label_surf, label_rect)
+                label_rect.clamp_ip(self.screen.get_rect().inflate(-12, -12))
+                ui_theme.draw_text_pill(self.screen, label_surf, label_rect.center, theme=self.theme)
         
         # Destruction feedback visuals intentionally disabled; notifications handled via text only.
         # ===== UI LAYER (Drawn last, on top of objects) =====
         
-        # Draw top bar background (dark, flat)
+        # Draw top bar background (flat, hairline bottom edge)
         top_bar_height = self.top_bar_button_height + 2*self.tab_margin
         top_bar_rect = pygame.Rect(0, 0, self.width, top_bar_height)
-        pygame.draw.rect(self.screen, (35, 40, 50), top_bar_rect)
+        ui_theme.draw_top_bar(self.screen, top_bar_rect, self.theme)
         
         # === LEFT SECTION: Add Body dropdown ===
         self.draw_add_body_dropdown()
@@ -18616,8 +18766,8 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         
         # Draw customization panel only if a body is selected
         if self.show_customization_panel and self.selected_body:
-            # Draw panel background (match dropdown menu dark blue)
-            pygame.draw.rect(self.screen, self.UI_PANEL_BG, self.customization_panel)
+            # Panel surface with hairline inner edge
+            ui_theme.draw_side_panel(self.screen, self.customization_panel, self.theme)
             
             # Draw customization panel header: display name + optional * (tooltip) + Rename (pencil), or inline edit when renaming
             disp_name = self._body_display_name(self.selected_body, for_export=False)
@@ -18631,9 +18781,8 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 # Inline text edit: input box + hint
                 input_w = min(220, self.customization_panel_width - 80)
                 self.rename_edit_rect = pygame.Rect(self.width - self.customization_panel_width//2 - input_w//2, 48, input_w, 24)
-                pygame.draw.rect(self.screen, self.WHITE, self.rename_edit_rect)
-                pygame.draw.rect(self.screen, self.BLACK, self.rename_edit_rect, 2)
-                edit_surf = self.subtitle_font.render(self.rename_edit_text + ("|" if pygame.time.get_ticks() % 1000 < 500 else ""), True, self.BLACK)
+                ui_theme.draw_input_field(self.screen, self.rename_edit_rect, focused=True, theme=self.theme)
+                edit_surf = self.subtitle_font.render(self.rename_edit_text + ("|" if pygame.time.get_ticks() % 1000 < 500 else ""), True, self.theme.text_primary)
                 self.screen.blit(edit_surf, (self.rename_edit_rect.left + 4, self.rename_edit_rect.centery - edit_surf.get_height()//2))
                 hint = self.tiny_font.render("Enter: Save  Esc: Cancel", True, self.UI_PANEL_MUTED_TEXT)
                 hint_rect = hint.get_rect(center=(self.width - self.customization_panel_width//2, 78))
@@ -18648,19 +18797,41 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             badge_y = 75
             badge_x = self.width - self.customization_panel_width + 50
             
+            # Provenance row: body type + preset / modified / custom. Read-only view of
+            # fields the body already carries (preset_type, modified_from_preset).
+            tag_x = badge_x + (24 if self.selected_body.get('type') in ('planet', 'moon') else 0)
+            body_type = str(self.selected_body.get('type', 'body'))
+            type_tag = ui_theme.draw_tag(
+                self.screen, self.micro_font, body_type, (tag_x, badge_y - 1), kind="modified", theme=self.theme,
+            )
+            if preset_type:
+                if self.selected_body.get('modified_from_preset'):
+                    ui_theme.draw_tag(
+                        self.screen, self.micro_font, "modified from preset", (type_tag.right + 6, badge_y - 1),
+                        kind="modified", theme=self.theme,
+                    )
+                else:
+                    ui_theme.draw_tag(
+                        self.screen, self.micro_font, "preset values", (type_tag.right + 6, badge_y - 1),
+                        kind="measured", theme=self.theme,
+                    )
+            else:
+                ui_theme.draw_tag(
+                    self.screen, self.micro_font, "custom", (type_tag.right + 6, badge_y - 1),
+                    kind="assumed", theme=self.theme,
+                )
+            
             if self.selected_body.get('type') == 'planet' or self.selected_body.get('type') == 'moon':
                 # Info icon for climate/axial information (single shared icon above dropdowns)
                 info_icon_size = 16
                 self.climate_info_icon_rect = pygame.Rect(badge_x, badge_y, info_icon_size, info_icon_size)
-                
-                # Draw info icon (circle with 'i') - make it more visible and clickable
-                # Draw filled circle background for better visibility
-                pygame.draw.circle(self.screen, (200, 220, 255), self.climate_info_icon_rect.center, info_icon_size // 2)
-                # Draw border
-                pygame.draw.circle(self.screen, (100, 150, 255), self.climate_info_icon_rect.center, info_icon_size // 2, 2)
-                info_text = self.tiny_font.render("i", True, (50, 100, 200))
-                info_text_rect = info_text.get_rect(center=self.climate_info_icon_rect.center)
-                self.screen.blit(info_text, info_text_rect)
+                climate_hover = self.climate_info_icon_rect.inflate(10, 10).collidepoint(self._mouse_pos())
+                ui_theme.draw_info_glyph(
+                    self.screen, self.climate_info_icon_rect.center, self.tiny_font,
+                    radius=info_icon_size // 2,
+                    hover=(climate_hover or bool(getattr(self, "climate_info_pinned", False))),
+                    theme=self.theme,
+                )
                 
                 # Debug: Draw hitbox outline (remove in production)
                 # expanded_debug = self.climate_info_icon_rect.inflate(6, 6)
@@ -18684,7 +18855,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                     
                     # Show tooltip on hover or if pinned
                     # Use slightly expanded hitbox for easier hover detection
-                    mouse_pos = pygame.mouse.get_pos()
+                    mouse_pos = self._mouse_pos()
                     expanded_hover_rect = self.climate_info_icon_rect.inflate(10, 10)
                     hovering_icon = expanded_hover_rect.collidepoint(mouse_pos)
                     is_pinned = getattr(self, "climate_info_pinned", False)
@@ -18705,17 +18876,16 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                     warning_badge_y = badge_y + 25  # Below climate info icon
                     warning_badge_rect = pygame.Rect(warning_badge_x, warning_badge_y, warning_badge_size, warning_badge_size)
                     
-                    # Draw filled red circle
-                    pygame.draw.circle(self.screen, (255, 0, 0), warning_badge_rect.center, warning_badge_size // 2)
-                    pygame.draw.circle(self.screen, (200, 0, 0), warning_badge_rect.center, warning_badge_size // 2, 2)
+                    # Warning badge (orange = engulfment / instability)
+                    pygame.draw.circle(self.screen, self.theme.warning, warning_badge_rect.center, warning_badge_size // 2)
                     
                     # Draw exclamation mark
-                    warning_text = self.tiny_font.render("!", True, self.WHITE)
+                    warning_text = self.tiny_font.render("!", True, (20, 16, 8))
                     warning_text_rect = warning_text.get_rect(center=warning_badge_rect.center)
                     self.screen.blit(warning_text, warning_text_rect)
                     
                     # Tooltip on hover
-                    mouse_pos = pygame.mouse.get_pos()
+                    mouse_pos = self._mouse_pos()
                     expanded_warning_rect = warning_badge_rect.inflate(10, 10)
                     hovering_warning = expanded_warning_rect.collidepoint(mouse_pos)
                     if hovering_warning:
@@ -18747,11 +18917,11 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             
             # MASS SECTION (always show mass label/input, dropdown only for planets)
             if self.selected_body.get('type') == 'moon':
-                mass_label = self.subtitle_font.render("Mass (Lunar masses)", True, self.UI_PANEL_TEXT)
+                mass_label = self.tab_font.render("Mass (Lunar masses)", True, self.UI_PANEL_MUTED_TEXT)
             elif self.selected_body.get('type') == 'star':
-                mass_label = self.subtitle_font.render("Mass (Solar masses)", True, self.UI_PANEL_TEXT)
+                mass_label = self.tab_font.render("Mass (Solar masses)", True, self.UI_PANEL_MUTED_TEXT)
             else:
-                mass_label = self.subtitle_font.render("Mass (Earth masses)", True, self.UI_PANEL_TEXT)
+                mass_label = self.tab_font.render("Mass (Earth masses)", True, self.UI_PANEL_MUTED_TEXT)
             mass_label_rect = mass_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 105))
             self.screen.blit(mass_label, mass_label_rect)
             
@@ -18837,18 +19007,18 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                     last_part = parts[1] if len(parts) > 1 else ""
                     
                     # Render first part
-                    surf1 = self.subtitle_font.render(first_part, True, self.BLACK)
+                    surf1 = self.subtitle_font.render(first_part, True, self.UI_PANEL_TEXT)
                     rect1 = surf1.get_rect(midleft=(self.star_mass_dropdown_rect.left + 5, self.star_mass_dropdown_rect.centery))
                     self.screen.blit(surf1, rect1)
                     
                     # Render limit text smaller
-                    surf2 = self.tiny_font.render(limit_text, True, self.BLACK)
+                    surf2 = self.tiny_font.render(limit_text, True, self.UI_PANEL_TEXT)
                     rect2 = surf2.get_rect(midleft=(rect1.right, self.star_mass_dropdown_rect.centery))
                     self.screen.blit(surf2, rect2)
                     
                     # Render last part (the closing parenthesis)
                     if last_part:
-                        surf3 = self.subtitle_font.render(last_part, True, self.BLACK)
+                        surf3 = self.subtitle_font.render(last_part, True, self.UI_PANEL_TEXT)
                         rect3 = surf3.get_rect(midleft=(rect2.right, self.star_mass_dropdown_rect.centery))
                         self.screen.blit(surf3, rect3)
                 else:
@@ -18884,19 +19054,19 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                                         text = f"{name} ({value:.4f})"
                                     else:
                                         text = f"{name} ({value:.2f})"
-                                    text_surface = self.subtitle_font.render(text, True, self.BLACK)
+                                    text_surface = self.subtitle_font.render(text, True, self.UI_PANEL_TEXT)
                                 else:
-                                    text_surface = self.subtitle_font.render(name, True, self.BLACK)
+                                    text_surface = self.subtitle_font.render(name, True, self.UI_PANEL_TEXT)
                             else:
-                                text_surface = self.subtitle_font.render(label, True, self.BLACK)
+                                text_surface = self.subtitle_font.render(label, True, self.UI_PANEL_TEXT)
                         else:
-                            text_surface = self.subtitle_font.render(self._format_value(body.get('mass', 0.0123), '', for_dropdown=False), True, self.BLACK)
+                            text_surface = self.subtitle_font.render(self._format_value(body.get('mass', 0.0123), '', for_dropdown=False), True, self.UI_PANEL_TEXT)
                     else:
                         label = body.get("star_mass_dropdown_selected")
                         if label:
-                            text_surface = self.subtitle_font.render(label, True, self.BLACK)
+                            text_surface = self.subtitle_font.render(label, True, self.UI_PANEL_TEXT)
                         else:
-                            text_surface = self.subtitle_font.render(self._format_value(body.get('mass', 1.0), '', for_dropdown=False), True, self.BLACK)
+                            text_surface = self.subtitle_font.render(self._format_value(body.get('mass', 1.0), '', for_dropdown=False), True, self.UI_PANEL_TEXT)
                 else:
                     text_surface = self.subtitle_font.render("N/A", True, self.UI_PANEL_TEXT)
                 
@@ -18906,9 +19076,10 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             # AGE SECTION (moved up closer to mass section)
             # Only show "Age (Gyr)" label for planets and moons, not stars (stars have their own "Star Age (Gyr)" label)
             if self.selected_body.get('type') in ['planet', 'moon']:
-                age_label = self.subtitle_font.render("Age (Gyr)", True, self.UI_PANEL_TEXT)
+                age_label = self.tab_font.render("Age (Gyr)", True, self.UI_PANEL_MUTED_TEXT)
                 age_label_rect = age_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 165))
                 self.screen.blit(age_label, age_label_rect)
+                self._draw_field_tag(age_label_rect, self._provenance_kind(self.selected_body, "age"), "assumed")
 
             if self.selected_body.get('type') == 'planet':
                 # For planets, show the age dropdown
@@ -18927,7 +19098,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
 
                 # Show custom age input if "Custom Age" is selected
                 if self.show_custom_age_input:
-                    custom_age_label = self.subtitle_font.render("Enter Custom Age (Gyr):", True, self.UI_PANEL_TEXT)
+                    custom_age_label = self.tab_font.render("Enter Custom Age (Gyr):", True, self.UI_PANEL_MUTED_TEXT)
                     custom_age_label_rect = custom_age_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 225))
                     self.screen.blit(custom_age_label, custom_age_label_rect)
                     
@@ -18935,9 +19106,9 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                     pygame.draw.rect(self.screen, self.UI_PANEL_TEXT if self.age_input_active else self.UI_PANEL_MUTED_TEXT, 
                                    self.age_input_rect, 1)
                     if self.age_input_active:
-                        text_surface = self.subtitle_font.render(self.age_input_text, True, self.BLACK)
+                        text_surface = self.subtitle_font.render(self.age_input_text, True, self.theme.text_primary)
                     else:
-                        text_surface = self.subtitle_font.render(self._format_value(self.selected_body.get('age', 0.0), '', for_dropdown=False), True, self.BLACK)
+                        text_surface = self.subtitle_font.render(self._format_value(self.selected_body.get('age', 0.0), '', for_dropdown=False), True, self.UI_PANEL_TEXT)
                     text_rect = text_surface.get_rect(midleft=(self.age_input_rect.left + 5, 
                                                              self.age_input_rect.centery))
                     self.screen.blit(text_surface, text_rect)
@@ -18963,7 +19134,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 # REMOVED: Inline custom age input (now handled by modal)
                 
                 # RADIUS SECTION (only for moons)
-                radius_label = self.subtitle_font.render("Radius (km)", True, self.UI_PANEL_TEXT)
+                radius_label = self.tab_font.render("Radius (km)", True, self.UI_PANEL_MUTED_TEXT)
                 radius_label_rect = radius_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 225))
                 self.screen.blit(radius_label, radius_label_rect)
                 
@@ -18992,7 +19163,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 # REMOVED: Inline custom radius input (now handled by modal)
                 
                 # ORBITAL DISTANCE SECTION (only for moons)
-                orbital_distance_label = self.subtitle_font.render("Orbital Distance (km)", True, self.UI_PANEL_TEXT)
+                orbital_distance_label = self.tab_font.render("Orbital Distance (km)", True, self.UI_PANEL_MUTED_TEXT)
                 orbital_distance_label_rect = orbital_distance_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 285))
                 self.screen.blit(orbital_distance_label, orbital_distance_label_rect)
                 
@@ -19030,7 +19201,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 # REMOVED: Inline custom orbital distance input (now handled by modal)
                 
                 # ORBITAL PERIOD SECTION (only for moons)
-                orbital_period_label = self.subtitle_font.render("Orbital Period (days)", True, self.UI_PANEL_TEXT)
+                orbital_period_label = self.tab_font.render("Orbital Period (days)", True, self.UI_PANEL_MUTED_TEXT)
                 orbital_period_label_rect = orbital_period_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 345))
                 self.screen.blit(orbital_period_label, orbital_period_label_rect)
                 
@@ -19058,19 +19229,18 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 
                 # Show custom orbital period input if "Custom" is selected
                 if self.show_custom_moon_orbital_period_input:
-                    custom_period_label = self.subtitle_font.render("Enter Custom Period (days):", True, self.UI_PANEL_TEXT)
+                    custom_period_label = self.tab_font.render("Enter Custom Period (days):", True, self.UI_PANEL_MUTED_TEXT)
                     custom_period_label_rect = custom_period_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 405))
                     self.screen.blit(custom_period_label, custom_period_label_rect)
                     
                     custom_period_input_rect = pygame.Rect(self.width - self.customization_panel_width + 50, 435, self.customization_panel_width - 100, 30)
-                    pygame.draw.rect(self.screen, self.UI_PANEL_BG, custom_period_input_rect)
-                    pygame.draw.rect(self.screen, self.UI_PANEL_BORDER, custom_period_input_rect, 1)
-                    text_surface = self.subtitle_font.render(self.orbital_period_input_text, True, self.BLACK)
+                    ui_theme.draw_input_field(self.screen, custom_period_input_rect, focused=True, theme=self.theme)
+                    text_surface = self.subtitle_font.render(self.orbital_period_input_text, True, self.theme.text_primary)
                     text_rect = text_surface.get_rect(midleft=(custom_period_input_rect.left + 5, custom_period_input_rect.centery))
                     self.screen.blit(text_surface, text_rect)
                 
                 # SURFACE TEMPERATURE SECTION (only for moons)
-                temperature_label = self.subtitle_font.render("Surface Temperature (K)", True, self.UI_PANEL_TEXT)
+                temperature_label = self.tab_font.render("Surface Temperature (K)", True, self.UI_PANEL_MUTED_TEXT)
                 temperature_label_rect = temperature_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 405))
                 self.screen.blit(temperature_label, temperature_label_rect)
                 # Add tooltip icon for Surface Temperature
@@ -19127,19 +19297,18 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
 
                 # Show custom temperature input if "Custom" is selected
                 if self.show_custom_moon_temperature_input:
-                    custom_temp_label = self.subtitle_font.render("Enter Custom Temperature (K):", True, self.UI_PANEL_TEXT)
+                    custom_temp_label = self.tab_font.render("Enter Custom Temperature (K):", True, self.UI_PANEL_MUTED_TEXT)
                     custom_temp_label_rect = custom_temp_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 465))
                     self.screen.blit(custom_temp_label, custom_temp_label_rect)
                     
                     custom_temp_input_rect = pygame.Rect(self.width - self.customization_panel_width + 50, 495, self.customization_panel_width - 100, 30)
-                    pygame.draw.rect(self.screen, self.UI_PANEL_BG, custom_temp_input_rect)
-                    pygame.draw.rect(self.screen, self.UI_PANEL_BORDER, custom_temp_input_rect, 1)
-                    text_surface = self.subtitle_font.render(self.planet_temperature_input_text, True, self.BLACK)
+                    ui_theme.draw_input_field(self.screen, custom_temp_input_rect, focused=True, theme=self.theme)
+                    text_surface = self.subtitle_font.render(self.planet_temperature_input_text, True, self.theme.text_primary)
                     text_rect = text_surface.get_rect(midleft=(custom_temp_input_rect.left + 5, custom_temp_input_rect.centery))
                     self.screen.blit(text_surface, text_rect)
                 
                 # SURFACE GRAVITY SECTION (only for moons)
-                gravity_label = self.subtitle_font.render("Surface Gravity (m/s²)", True, self.UI_PANEL_TEXT)
+                gravity_label = self.tab_font.render("Surface Gravity (m/s²)", True, self.UI_PANEL_MUTED_TEXT)
                 gravity_label_rect = gravity_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 465 + moon_temp_push_y))
                 self.screen.blit(gravity_label, gravity_label_rect)
                 
@@ -19174,13 +19343,12 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
 
                 # Show custom gravity input if "Custom" is selected
                 if self.show_custom_moon_gravity_input:
-                    custom_gravity_label = self.subtitle_font.render("Enter Custom Gravity (m/s²):", True, self.UI_PANEL_TEXT)
+                    custom_gravity_label = self.tab_font.render("Enter Custom Gravity (m/s²):", True, self.UI_PANEL_MUTED_TEXT)
                     custom_gravity_label_rect = custom_gravity_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 525 + moon_temp_push_y))
                     self.screen.blit(custom_gravity_label, custom_gravity_label_rect)
                     
                     custom_gravity_input_rect = pygame.Rect(self.width - self.customization_panel_width + 50, 555 + moon_temp_push_y, self.customization_panel_width - 100, 30)
-                    pygame.draw.rect(self.screen, self.UI_PANEL_BG, custom_gravity_input_rect)
-                    pygame.draw.rect(self.screen, self.UI_PANEL_BORDER, custom_gravity_input_rect, 1)
+                    ui_theme.draw_input_field(self.screen, custom_gravity_input_rect, focused=True, theme=self.theme)
                     text_surface = self.subtitle_font.render(self.moon_gravity_input_text, True, self.UI_PANEL_TEXT)
                     text_rect = text_surface.get_rect(midleft=(custom_gravity_input_rect.left + 5, custom_gravity_input_rect.centery))
                     self.screen.blit(text_surface, text_rect)
@@ -19190,7 +19358,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             
             # RADIUS SECTION (only for planets)
             if self.selected_body.get('type') == 'planet':
-                radius_label = self.subtitle_font.render("Radius (Earth radii)", True, self.UI_PANEL_TEXT)
+                radius_label = self.tab_font.render("Radius (Earth radii)", True, self.UI_PANEL_MUTED_TEXT)
                 radius_label_rect = radius_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 225))
                 self.screen.blit(radius_label, radius_label_rect)
                 
@@ -19218,22 +19386,20 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 
                 # Show custom radius input if "Custom" is selected, just below dropdown
                 if self.show_custom_radius_input and self.selected_body.get('type') == 'planet':
-                    custom_radius_label = self.subtitle_font.render("Enter Custom Radius (Earth radii):", True, self.UI_PANEL_TEXT)
+                    custom_radius_label = self.tab_font.render("Enter Custom Radius (Earth radii):", True, self.UI_PANEL_MUTED_TEXT)
                     custom_radius_label_rect = custom_radius_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 275))
                     self.screen.blit(custom_radius_label, custom_radius_label_rect)
                     
                     custom_radius_input_rect = pygame.Rect(self.width - self.customization_panel_width + 50, 305, self.customization_panel_width - 100, 30)
-                    pygame.draw.rect(self.screen, self.UI_PANEL_BG, custom_radius_input_rect)
-                    pygame.draw.rect(self.screen, self.UI_PANEL_TEXT if self.radius_input_active else self.UI_PANEL_MUTED_TEXT,
-                                   custom_radius_input_rect, 1)
-                    text_surface = self.subtitle_font.render(self.radius_input_text, True, self.BLACK)
+                    ui_theme.draw_input_field(self.screen, custom_radius_input_rect, focused=True, theme=self.theme)
+                    text_surface = self.subtitle_font.render(self.radius_input_text, True, self.theme.text_primary)
                     text_rect = text_surface.get_rect(midleft=(custom_radius_input_rect.left + 5,
                                                              custom_radius_input_rect.centery))
                     self.screen.blit(text_surface, text_rect)
             
             # TEMPERATURE SECTION (only for planets)
             if self.selected_body.get('type') == 'planet':
-                temperature_label = self.subtitle_font.render("Surface Temperature (K)", True, self.UI_PANEL_TEXT)
+                temperature_label = self.tab_font.render("Surface Temperature (K)", True, self.UI_PANEL_MUTED_TEXT)
                 temperature_label_rect = temperature_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 285))
                 self.screen.blit(temperature_label, temperature_label_rect)
                 # Add tooltip icon for Surface Temperature
@@ -19275,11 +19441,15 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 # --------------------------------------------------------
 
                 # ATMOSPHERIC COMPOSITION / GREENHOUSE TYPE SECTION (only for planets)
-                atmosphere_label = self.subtitle_font.render("Atmosphere Warming (ΔT, K)", True, self.UI_PANEL_TEXT)
+                atmosphere_label = self.tab_font.render("Atmosphere Warming (ΔT, K)", True, self.UI_PANEL_MUTED_TEXT)
                 atmosphere_label_rect = atmosphere_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 345 + temp_push_y))
                 self.screen.blit(atmosphere_label, atmosphere_label_rect)
                 # Add tooltip icon for Atmosphere Warming
-                self.draw_tooltip_icon(atmosphere_label_rect, "Atmosphere Warming")
+                atmosphere_icon_rect = self.draw_tooltip_icon(atmosphere_label_rect, "Atmosphere Warming")
+                self._draw_field_tag(
+                    atmosphere_icon_rect or atmosphere_label_rect,
+                    self._provenance_kind(self.selected_body, "atmosphere"), "assumed",
+                )
                 
                 # Draw the planet atmospheric composition dropdown
                 self.planet_atmosphere_dropdown_rect.y = 360 + temp_push_y
@@ -19308,21 +19478,20 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 
                 # Show custom atmosphere input if "Custom" is selected, just below dropdown
                 if self.show_custom_atmosphere_input:
-                    custom_atmosphere_label = self.subtitle_font.render("Enter Custom ΔT (K):", True, self.UI_PANEL_TEXT)
+                    custom_atmosphere_label = self.tab_font.render("Enter Custom ΔT (K):", True, self.UI_PANEL_MUTED_TEXT)
                     custom_atmosphere_label_rect = custom_atmosphere_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 415))
                     self.screen.blit(custom_atmosphere_label, custom_atmosphere_label_rect)
                     
                     custom_atmosphere_input_rect = pygame.Rect(self.width - self.customization_panel_width + 50, 445, self.customization_panel_width - 100, 30)
                     # Match visual style with other parameter inputs: panel
                     # background fill with a subtle outline color.
-                    pygame.draw.rect(self.screen, self.UI_PANEL_BG, custom_atmosphere_input_rect)
-                    pygame.draw.rect(self.screen, self.UI_PANEL_BORDER, custom_atmosphere_input_rect, 1)
-                    text_surface = self.subtitle_font.render(self.planet_atmosphere_input_text, True, self.BLACK)
+                    ui_theme.draw_input_field(self.screen, custom_atmosphere_input_rect, focused=True, theme=self.theme)
+                    text_surface = self.subtitle_font.render(self.planet_atmosphere_input_text, True, self.theme.text_primary)
                     text_rect = text_surface.get_rect(midleft=(custom_atmosphere_input_rect.left + 5, custom_atmosphere_input_rect.centery))
                     self.screen.blit(text_surface, text_rect)
 
                 # GRAVITY SECTION (only for planets)
-                gravity_label = self.subtitle_font.render("Surface Gravity (m/s²)", True, self.UI_PANEL_TEXT)
+                gravity_label = self.tab_font.render("Surface Gravity (m/s²)", True, self.UI_PANEL_MUTED_TEXT)
                 gravity_label_rect = gravity_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 405 + temp_push_y))
                 self.screen.blit(gravity_label, gravity_label_rect)
                 self.planet_gravity_dropdown_rect.y = 420 + temp_push_y
@@ -19348,18 +19517,17 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 
                 # Show custom gravity input if "Custom" is selected, just below dropdown
                 if self.show_custom_planet_gravity_input:
-                    custom_gravity_label = self.subtitle_font.render("Enter Custom Gravity (m/s²):", True, self.UI_PANEL_TEXT)
+                    custom_gravity_label = self.tab_font.render("Enter Custom Gravity (m/s²):", True, self.UI_PANEL_MUTED_TEXT)
                     custom_gravity_label_rect = custom_gravity_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 415 + temp_push_y))
                     self.screen.blit(custom_gravity_label, custom_gravity_label_rect)
                     
                     custom_gravity_input_rect = pygame.Rect(self.width - self.customization_panel_width + 50, 445 + temp_push_y, self.customization_panel_width - 100, 30)
-                    pygame.draw.rect(self.screen, self.UI_PANEL_BG, custom_gravity_input_rect)
-                    pygame.draw.rect(self.screen, self.UI_PANEL_BORDER, custom_gravity_input_rect, 1)
+                    ui_theme.draw_input_field(self.screen, custom_gravity_input_rect, focused=True, theme=self.theme)
                     text_surface = self.subtitle_font.render(self.planet_gravity_input_text, True, self.UI_PANEL_TEXT)
                     text_rect = text_surface.get_rect(midleft=(custom_gravity_input_rect.left + 5, custom_gravity_input_rect.centery))
                     self.screen.blit(text_surface, text_rect)
                 # Orbital Distance (AU) dropdown
-                orbital_distance_label = self.subtitle_font.render("Orbital Distance (AU)", True, self.UI_PANEL_TEXT)
+                orbital_distance_label = self.tab_font.render("Orbital Distance (AU)", True, self.UI_PANEL_MUTED_TEXT)
                 orbital_distance_label_rect = orbital_distance_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 465 + temp_push_y))
                 self.screen.blit(orbital_distance_label, orbital_distance_label_rect)
                 self.planet_orbital_distance_dropdown_rect.y = 480 + temp_push_y
@@ -19385,17 +19553,16 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 
                 # Show custom orbital distance input if "Custom" is selected, just below dropdown
                 if self.show_custom_orbital_distance_input:
-                    custom_orbital_label = self.subtitle_font.render("Enter Custom Distance (AU):", True, self.UI_PANEL_TEXT)
+                    custom_orbital_label = self.tab_font.render("Enter Custom Distance (AU):", True, self.UI_PANEL_MUTED_TEXT)
                     custom_orbital_label_rect = custom_orbital_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 455 + temp_push_y))
                     self.screen.blit(custom_orbital_label, custom_orbital_label_rect)
                     custom_orbital_input_rect = pygame.Rect(self.width - self.customization_panel_width + 50, 485 + temp_push_y, self.customization_panel_width - 100, 30)
-                    pygame.draw.rect(self.screen, self.UI_PANEL_BG, custom_orbital_input_rect)
-                    pygame.draw.rect(self.screen, self.UI_PANEL_BORDER, custom_orbital_input_rect, 1)
+                    ui_theme.draw_input_field(self.screen, custom_orbital_input_rect, focused=True, theme=self.theme)
                     text_surface = self.subtitle_font.render(self.orbital_distance_input_text, True, self.UI_PANEL_TEXT)
                     text_rect = text_surface.get_rect(midleft=(custom_orbital_input_rect.left + 5, custom_orbital_input_rect.centery))
                     self.screen.blit(text_surface, text_rect)
                 # Orbital Eccentricity dropdown
-                orbital_eccentricity_label = self.subtitle_font.render("Orbital Eccentricity", True, self.UI_PANEL_TEXT)
+                orbital_eccentricity_label = self.tab_font.render("Orbital Eccentricity", True, self.UI_PANEL_MUTED_TEXT)
                 orbital_eccentricity_label_rect = orbital_eccentricity_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 525 + temp_push_y))
                 self.screen.blit(orbital_eccentricity_label, orbital_eccentricity_label_rect)
                 # Add tooltip icon for Orbital Eccentricity
@@ -19424,18 +19591,17 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
 
                 # Show custom orbital eccentricity input if "Custom" is selected, just below dropdown
                 if self.show_custom_orbital_eccentricity_input:
-                    custom_eccentricity_label = self.subtitle_font.render("Enter Custom Eccentricity:", True, self.UI_PANEL_TEXT)
+                    custom_eccentricity_label = self.tab_font.render("Enter Custom Eccentricity:", True, self.UI_PANEL_MUTED_TEXT)
                     custom_eccentricity_label_rect = custom_eccentricity_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 515))
                     self.screen.blit(custom_eccentricity_label, custom_eccentricity_label_rect)
                     custom_eccentricity_input_rect = pygame.Rect(self.width - self.customization_panel_width + 50, 545, self.customization_panel_width - 100, 30)
-                    pygame.draw.rect(self.screen, self.UI_PANEL_BG, custom_eccentricity_input_rect)
-                    pygame.draw.rect(self.screen, self.UI_PANEL_BORDER, custom_eccentricity_input_rect, 1)
-                    text_surface = self.subtitle_font.render(self.orbital_eccentricity_input_text, True, self.BLACK)
+                    ui_theme.draw_input_field(self.screen, custom_eccentricity_input_rect, focused=True, theme=self.theme)
+                    text_surface = self.subtitle_font.render(self.orbital_eccentricity_input_text, True, self.theme.text_primary)
                     text_rect = text_surface.get_rect(midleft=(custom_eccentricity_input_rect.left + 5, custom_eccentricity_input_rect.centery))
                     self.screen.blit(text_surface, text_rect)
                 
                 # Orbital Period dropdown
-                orbital_period_label = self.subtitle_font.render("Orbital Period (days)", True, self.UI_PANEL_TEXT)
+                orbital_period_label = self.tab_font.render("Orbital Period (days)", True, self.UI_PANEL_MUTED_TEXT)
                 orbital_period_label_rect = orbital_period_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 585 + temp_push_y))
                 self.screen.blit(orbital_period_label, orbital_period_label_rect)
                 self.planet_orbital_period_dropdown_rect.y = 600 + temp_push_y
@@ -19461,7 +19627,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 
                 # REMOVED: Inline custom orbital period input (now handled by modal)
                 # Stellar Flux dropdown
-                stellar_flux_label = self.subtitle_font.render("Stellar Flux (Earth Units)", True, self.UI_PANEL_TEXT)
+                stellar_flux_label = self.tab_font.render("Stellar Flux (Earth Units)", True, self.UI_PANEL_MUTED_TEXT)
                 stellar_flux_label_rect = stellar_flux_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 645 + temp_push_y))
                 self.screen.blit(stellar_flux_label, stellar_flux_label_rect)
                 # Add tooltip icon for Stellar Flux
@@ -19488,17 +19654,16 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 self.screen.blit(text_surface, text_rect)
                 # Show custom stellar flux input if "Custom" is selected, just below dropdown
                 if self.show_custom_stellar_flux_input:
-                    custom_flux_label = self.subtitle_font.render("Enter Custom Flux (EFU):", True, self.UI_PANEL_TEXT)
+                    custom_flux_label = self.tab_font.render("Enter Custom Flux (EFU):", True, self.UI_PANEL_MUTED_TEXT)
                     custom_flux_label_rect = custom_flux_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 685 + temp_push_y))
                     self.screen.blit(custom_flux_label, custom_flux_label_rect)
                     custom_flux_input_rect = pygame.Rect(self.width - self.customization_panel_width + 50, 715 + temp_push_y, self.customization_panel_width - 100, 30)
-                    pygame.draw.rect(self.screen, self.UI_PANEL_BG, custom_flux_input_rect)
-                    pygame.draw.rect(self.screen, self.UI_PANEL_BORDER, custom_flux_input_rect, 1)
-                    text_surface = self.subtitle_font.render(self.stellar_flux_input_text, True, self.BLACK)
+                    ui_theme.draw_input_field(self.screen, custom_flux_input_rect, focused=True, theme=self.theme)
+                    text_surface = self.subtitle_font.render(self.stellar_flux_input_text, True, self.theme.text_primary)
                     text_rect = text_surface.get_rect(midleft=(custom_flux_input_rect.left + 5, custom_flux_input_rect.centery))
                     self.screen.blit(text_surface, text_rect)
                 # Density dropdown (NEW)
-                density_label = self.subtitle_font.render("Density (g/cm³)", True, self.UI_PANEL_TEXT)
+                density_label = self.tab_font.render("Density (g/cm³)", True, self.UI_PANEL_MUTED_TEXT)
                 density_label_rect = density_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 705 + temp_push_y))
                 self.screen.blit(density_label, density_label_rect)
                 self.planet_density_dropdown_rect.y = 720 + temp_push_y
@@ -19526,17 +19691,23 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 self.screen.blit(text_surface, text_rect)
                 # Show custom density input if "Custom" is selected, just below dropdown
                 if self.show_custom_planet_density_input:
-                    custom_density_label = self.subtitle_font.render("Enter Custom Density (g/cm³):", True, self.UI_PANEL_TEXT)
+                    custom_density_label = self.tab_font.render("Enter Custom Density (g/cm³):", True, self.UI_PANEL_MUTED_TEXT)
                     custom_density_label_rect = custom_density_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 745 + temp_push_y))
                     self.screen.blit(custom_density_label, custom_density_label_rect)
                     custom_density_input_rect = pygame.Rect(self.width - self.customization_panel_width + 50, 775 + temp_push_y, self.customization_panel_width - 100, 30)
                     pygame.draw.rect(self.screen, self.UI_PANEL_BORDER, custom_density_input_rect, 1)
-                    text_surface = self.subtitle_font.render(self.planet_density_input_text, True, self.BLACK)
+                    text_surface = self.subtitle_font.render(self.planet_density_input_text, True, self.theme.text_primary)
                     text_rect = text_surface.get_rect(midleft=(custom_density_input_rect.left + 5, custom_density_input_rect.centery))
                     self.screen.blit(text_surface, text_rect)
+                    self.detection_tab_button_rects = {}
+                else:
+                    # Detection launcher: radial velocity / transit / method comparison for this planet
+                    self._draw_detection_launcher()
+            else:
+                self.detection_tab_button_rects = {}
             # Draw spectral class dropdown for stars (merged from spectral and temperature dropdowns)
             if self.selected_body and self.selected_body.get('type') == 'star':
-                spectral_class_label = self.subtitle_font.render("Spectral Class (Temperature)", True, self.UI_PANEL_TEXT)
+                spectral_class_label = self.tab_font.render("Spectral Class (Temperature)", True, self.UI_PANEL_MUTED_TEXT)
                 spectral_class_label_rect = spectral_class_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 225))
                 self.screen.blit(spectral_class_label, spectral_class_label_rect)
                 self._draw_customization_field_box(self.spectral_class_dropdown_rect)
@@ -19549,7 +19720,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
 
                 # Draw custom temperature input if "Custom" is selected
                 if self.show_custom_temperature_input:
-                    custom_temp_label = self.subtitle_font.render("Enter Custom Temperature (K):", True, self.UI_PANEL_TEXT)
+                    custom_temp_label = self.tab_font.render("Enter Custom Temperature (K):", True, self.UI_PANEL_MUTED_TEXT)
                     custom_temp_label_rect = custom_temp_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 265))
                     self.screen.blit(custom_temp_label, custom_temp_label_rect)
                     custom_temp_input_rect = pygame.Rect(self.width - self.customization_panel_width + 50, 285, self.customization_panel_width - 100, 30)
@@ -19562,7 +19733,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                     self.screen.blit(text_surface, text_rect)
 
                 # Draw star age dropdown
-                age_label = self.subtitle_font.render("Star Age (Gyr)", True, self.UI_PANEL_TEXT)
+                age_label = self.tab_font.render("Star Age (Gyr)", True, self.UI_PANEL_MUTED_TEXT)
                 age_label_rect = age_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 165))
                 self.screen.blit(age_label, age_label_rect)
                 
@@ -19597,17 +19768,17 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                     # Draw custom age input in place of the dropdown when "Custom" is selected
                     self._draw_customization_field_box(self.star_age_dropdown_rect)
                     if self.age_input_active:
-                        text_surface = self.subtitle_font.render(self.age_input_text, True, self.BLACK)
+                        text_surface = self.subtitle_font.render(self.age_input_text, True, self.theme.text_primary)
                     else:
                         text_surface = self.subtitle_font.render(
                             self.format_age_display(self.selected_body.get("age", 0.0)), 
-                            True, self.BLACK
+                            True, self.UI_PANEL_TEXT
                         )
                     text_rect = text_surface.get_rect(midleft=(self.star_age_dropdown_rect.left + 5, self.star_age_dropdown_rect.centery))
                     self.screen.blit(text_surface, text_rect)
 
                 # Draw luminosity input for stars
-                luminosity_label = self.subtitle_font.render("Luminosity (Solar luminosities)", True, self.UI_PANEL_TEXT)
+                luminosity_label = self.tab_font.render("Luminosity (Solar luminosities)", True, self.UI_PANEL_MUTED_TEXT)
                 luminosity_label_rect = luminosity_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 285))
                 self.screen.blit(luminosity_label, luminosity_label_rect)
                 # Add tooltip icon for Luminosity
@@ -19630,7 +19801,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 self.screen.blit(text_surface, text_rect)
 
                 # Draw radius dropdown
-                radius_label = self.subtitle_font.render("Radius (Solar radii)", True, self.UI_PANEL_TEXT)
+                radius_label = self.tab_font.render("Radius (Solar radii)", True, self.UI_PANEL_MUTED_TEXT)
                 radius_label_rect = radius_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 345))
                 self.screen.blit(radius_label, radius_label_rect)
                 self._draw_customization_field_box(self.radius_dropdown_rect)
@@ -19654,7 +19825,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 self.screen.blit(text_surface, text_rect)
 
                 # Draw activity level dropdown
-                activity_label = self.subtitle_font.render("Activity Level", True, self.UI_PANEL_TEXT)
+                activity_label = self.tab_font.render("Activity Level", True, self.UI_PANEL_MUTED_TEXT)
                 activity_label_rect = activity_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 405))
                 self.screen.blit(activity_label, activity_label_rect)
                 self._draw_customization_field_box(self.activity_dropdown_rect)
@@ -19675,7 +19846,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 self.screen.blit(text_surface, text_rect)
 
                 # Draw metallicity dropdown
-                metallicity_label = self.subtitle_font.render("Metallicity [Fe/H]", True, self.UI_PANEL_TEXT)
+                metallicity_label = self.tab_font.render("Metallicity [Fe/H]", True, self.UI_PANEL_MUTED_TEXT)
                 metallicity_label_rect = metallicity_label.get_rect(midleft=(self.width - self.customization_panel_width + 50, 465))
                 self.screen.blit(metallicity_label, metallicity_label_rect)
                 # Add tooltip icon for Metallicity [Fe/H]
@@ -19696,12 +19867,20 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 text_surface = self.subtitle_font.render(dropdown_text, True, self.UI_PANEL_TEXT)
                 text_rect = text_surface.get_rect(midleft=(self.metallicity_dropdown_rect.left + 5, self.metallicity_dropdown_rect.centery))
                 self.screen.blit(text_surface, text_rect)
+
+                # Star Data launcher: opens the spectrum / H-R / evolution / properties panel
+                self._draw_star_data_launcher()
+            else:
+                self.star_data_tab_button_rects = {}
+        else:
+            self.star_data_tab_button_rects = {}
+            self.detection_tab_button_rects = {}
         
         # ===== TOP-LEVEL UI ELEMENTS (Drawn last, on top of everything) =====
         
         # Update placement preview position EVERY FRAME (frame-driven, not event-driven)
         # This ensures smooth cursor following regardless of event timing
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self._mouse_pos()
         
         # Update preview position every frame if in placement mode
         if self.placement_mode_active or self.planet_dropdown_selected:
@@ -19738,6 +19917,12 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         if self.preview_position and self.preview_radius and self.preview_radius > 0 and not self._any_dropdown_active():
             self.draw_placement_preview()
 
+        # Star Data / Detection panels sit over the sandbox viewport, under menus/modals
+        if self.star_data_panel:
+            self.star_data_panel.render()
+        if self.detection_panel:
+            self.detection_panel.render()
+
         # Render customization panel dropdown menu (planet orbital distance etc)
         self.render_dropdown()
 
@@ -19766,7 +19951,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         
         # Render tooltips for parameter icons (after all other UI)
         self.hovered_tooltip_param = None
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self._mouse_pos()
         for param_name, icon_rect in self.parameter_tooltip_icons.items():
             if icon_rect.collidepoint(mouse_pos):
                 self.hovered_tooltip_param = param_name
@@ -19820,6 +20005,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                     # 4) Named non-solar presets by name lookup
                     preview_hex = (
                         getattr(self, "trappist1_planet_presets", {}).get(planet_name, {}).get("base_color")
+                        or getattr(self, "kepler62_planet_presets", {}).get(planet_name, {}).get("base_color")
                         or getattr(self, "alpha_centauri_planet_presets", {}).get(planet_name, {}).get("base_color")
                     )
             if not preview_hex:
@@ -19906,8 +20092,8 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 # Draw semi-transparent orbit circle centered on planet
                 orbit_surface = pygame.Surface((orbit_radius_px * 2 + 4, orbit_radius_px * 2 + 4), pygame.SRCALPHA)
                 orbit_center = (orbit_surface.get_width() // 2, orbit_surface.get_height() // 2)
-                # Use grey color with alpha for semi-transparency (matches moon orbit color)
-                orbit_color = (100, 100, 100, 120)  # Semi-transparent grey
+                # Semi-transparent moon-orbit tone (matches placed moon rings)
+                orbit_color = (*self.theme.orbit_ring_moon, 160)
                 pygame.draw.circle(orbit_surface, orbit_color, orbit_center, orbit_radius_px, 2)
                 
                 planet_screen_x, planet_screen_y = int(nearest_planet_screen_pos[0]), int(nearest_planet_screen_pos[1])
@@ -19928,15 +20114,12 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             tooltip_text = "Click to place Star"
         else:
             tooltip_text = "Click to confirm placement."
-        tooltip_surface = self.subtitle_font.render(tooltip_text, True, self.WHITE)
-        tooltip_rect = tooltip_surface.get_rect(center=(center_x, center_y + scaled_preview_radius + 25))
-        
-        # Draw tooltip background for better visibility
-        tooltip_bg_rect = tooltip_rect.inflate(10, 5)
-        tooltip_bg_surface = pygame.Surface(tooltip_bg_rect.size, pygame.SRCALPHA)
-        tooltip_bg_surface.fill((0, 0, 0, 180))  # Semi-transparent black background
-        self.screen.blit(tooltip_bg_surface, tooltip_bg_rect)
-        self.screen.blit(tooltip_surface, tooltip_rect)
+        tooltip_surface = self.tiny_font.render(tooltip_text, True, self.theme.text_primary)
+        ui_theme.draw_text_pill(
+            self.screen, tooltip_surface,
+            (center_x, center_y + scaled_preview_radius + 22),
+            theme=self.theme,
+        )
     
     def create_habitable_zone(self, star):
         """
@@ -19959,10 +20142,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         if luminosity <= 0:
             return None
 
-        try:
-            from src.physics.kopparapu_hz import kopparapu_hz_boundaries_au
-        except ImportError:
-            from physics.kopparapu_hz import kopparapu_hz_boundaries_au
+        from src.physics.kopparapu_hz import kopparapu_hz_boundaries_au
 
         teff = float(star.get("star_temperature", star.get("temperature", 5780.0)))
         inner_HZ_AU, outer_HZ_AU, s_eff_in, s_eff_out = kopparapu_hz_boundaries_au(
@@ -19975,8 +20155,8 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         star["hz_model"] = "kopparapu_2013_conservative_rv_em"
         
         # Convert to pixels using perceptual scaling
-        inner_HZ_px = int(self.get_visual_orbit_radius(inner_HZ_AU))
-        outer_HZ_px = int(self.get_visual_orbit_radius(outer_HZ_AU))
+        inner_HZ_px = int(self.get_visual_orbit_radius(inner_HZ_AU, star))
+        outer_HZ_px = int(self.get_visual_orbit_radius(outer_HZ_AU, star))
         
         if outer_HZ_px <= 0:
             return None
@@ -20001,7 +20181,13 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         # This is much faster than the nested pixel loop which caused freezes/crashes
         width = max(1, outer_HZ_px - inner_HZ_px)
         mid_radius = inner_HZ_px + width // 2
-        pygame.draw.circle(hz_surface, (0, 255, 0, 60), center, mid_radius, width)
+        # Scientific overlay: low-alpha fill with hairline edges at the inner/outer bounds
+        hz_r, hz_g, hz_b, hz_a = self.theme.hz_overlay
+        pygame.draw.circle(hz_surface, (hz_r, hz_g, hz_b, hz_a), center, mid_radius, width)
+        edge_alpha = min(255, hz_a * 3)
+        pygame.draw.circle(hz_surface, (hz_r, hz_g, hz_b, edge_alpha), center, outer_HZ_px, 1)
+        if inner_HZ_px > 1:
+            pygame.draw.circle(hz_surface, (hz_r, hz_g, hz_b, edge_alpha), center, inner_HZ_px, 1)
         
         # Store HZ parameters in star for later use
         star["hz_inner_px"] = inner_HZ_px
@@ -20193,9 +20379,8 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             if self.show_rename_edit:
                 input_w = min(220, self.customization_panel_width - 80)
                 self.rename_edit_rect = pygame.Rect(self.width - self.customization_panel_width//2 - input_w//2, 48, input_w, 24)
-                pygame.draw.rect(self.screen, self.WHITE, self.rename_edit_rect)
-                pygame.draw.rect(self.screen, self.BLACK, self.rename_edit_rect, 2)
-                edit_surf = self.subtitle_font.render(self.rename_edit_text + ("|" if pygame.time.get_ticks() % 1000 < 500 else ""), True, self.BLACK)
+                ui_theme.draw_input_field(self.screen, self.rename_edit_rect, focused=True, theme=self.theme)
+                edit_surf = self.subtitle_font.render(self.rename_edit_text + ("|" if pygame.time.get_ticks() % 1000 < 500 else ""), True, self.theme.text_primary)
                 self.screen.blit(edit_surf, (self.rename_edit_rect.left + 4, self.rename_edit_rect.centery - edit_surf.get_height()//2))
                 hint = self.tiny_font.render("Enter: Save  Esc: Cancel", True, self.UI_PANEL_MUTED_TEXT)
                 hint_rect = hint.get_rect(center=(self.width - self.customization_panel_width//2, 78))
@@ -20226,7 +20411,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         # 4. Global UI Elements (Top-most)
         
         # Update preview position based on mouse
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self._mouse_pos()
         if self.placement_mode_active or self.planet_dropdown_selected:
             if self.planet_dropdown_selected:
                 self.preview_position = mouse_pos
@@ -20333,7 +20518,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         self.screen.blit(label, (self.width - self.customization_panel_width + 50, 105))
         self._draw_customization_field_box(self.planet_dropdown_rect)
         text = body.get("planet_dropdown_selected", "Select Planet")
-        self.screen.blit(self.subtitle_font.render(text, True, self.BLACK), (self.planet_dropdown_rect.left + 5, self.planet_dropdown_rect.centery - 10))
+        self.screen.blit(self.subtitle_font.render(text, True, self.UI_PANEL_TEXT), (self.planet_dropdown_rect.left + 5, self.planet_dropdown_rect.centery - 10))
         # (Other planet dropdowns follow similarly)
 
     def _render_moon_ui_content(self):
@@ -20343,14 +20528,14 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         self.screen.blit(label, (self.width - self.customization_panel_width + 50, 105))
         self._draw_customization_field_box(self.moon_dropdown_rect)
         text = body.get("moon_dropdown_selected", "Select Moon")
-        self.screen.blit(self.subtitle_font.render(text, True, self.BLACK), (self.moon_dropdown_rect.left + 5, self.moon_dropdown_rect.centery - 10))
+        self.screen.blit(self.subtitle_font.render(text, True, self.UI_PANEL_TEXT), (self.moon_dropdown_rect.left + 5, self.moon_dropdown_rect.centery - 10))
 
     def _render_orbit_toggles(self, body):
         """Render the show orbit / last rev toggles"""
-        pygame.draw.rect(self.screen, self.BLACK, self.orbit_enabled_checkbox, 2)
+        pygame.draw.rect(self.screen, self.UI_PANEL_TEXT, self.orbit_enabled_checkbox, 2)
         if body.get("orbit_enabled", True):
-            pygame.draw.line(self.screen, self.BLACK, (self.orbit_enabled_checkbox.left + 4, self.orbit_enabled_checkbox.centery), (self.orbit_enabled_checkbox.left + 8, self.orbit_enabled_checkbox.bottom - 4), 2)
-            pygame.draw.line(self.screen, self.BLACK, (self.orbit_enabled_checkbox.left + 8, self.orbit_enabled_checkbox.bottom - 4), (self.orbit_enabled_checkbox.right - 4, self.orbit_enabled_checkbox.top + 4), 2)
+            pygame.draw.line(self.screen, self.UI_PANEL_TEXT, (self.orbit_enabled_checkbox.left + 4, self.orbit_enabled_checkbox.centery), (self.orbit_enabled_checkbox.left + 8, self.orbit_enabled_checkbox.bottom - 4), 2)
+            pygame.draw.line(self.screen, self.UI_PANEL_TEXT, (self.orbit_enabled_checkbox.left + 8, self.orbit_enabled_checkbox.bottom - 4), (self.orbit_enabled_checkbox.right - 4, self.orbit_enabled_checkbox.top + 4), 2)
         label = self.subtitle_font.render("Show Orbit", True, self.UI_PANEL_TEXT)
         self.screen.blit(label, (self.orbit_enabled_checkbox.right + 10, self.orbit_enabled_checkbox.top))
 
@@ -20386,7 +20571,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 self.diagnostics_panel.render()
         
         # Hover over "modified from preset*" in customization panel → show tooltip
-        if getattr(self, "modified_from_preset_rect", None) and self.modified_from_preset_rect.collidepoint(pygame.mouse.get_pos()):
+        if getattr(self, "modified_from_preset_rect", None) and self.modified_from_preset_rect.collidepoint(self._mouse_pos()):
             self.active_tooltip = "This has been modified from preset."
             self.active_tooltip_anchor = (self.modified_from_preset_rect.centerx, self.modified_from_preset_rect.centery)
         
@@ -20429,7 +20614,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             self.pending_screenshot_export_dir = None
             self.pending_screenshot_restore_camera = None
         
-        pygame.display.flip() 
+        self._present_frame()
 
     def validate_custom_modal_input(self):
         """Validate the input text against physical bounds."""
@@ -20766,67 +20951,52 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         """Draw the centered custom value input modal."""
         if not self.show_custom_modal:
             return
+        theme = self.theme
+        mouse = self._mouse_pos()
 
-        # Modal dimensions
         modal_width = 400
         modal_height = 300
         modal_rect = pygame.Rect((self.width - modal_width) // 2, (self.height - modal_height) // 2, modal_width, modal_height)
-
-        # Draw semi-transparent overlay
-        overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 150))
-        self.screen.blit(overlay, (0, 0))
-
-        # Draw modal background
-        pygame.draw.rect(self.screen, self.WHITE, modal_rect, border_radius=10)
-        pygame.draw.rect(self.screen, self.BLUE, modal_rect, 2, border_radius=10)
+        ui_theme.draw_modal_frame(self.screen, modal_rect, tone="neutral", theme=theme)
 
         # Title
-        title_surf = self.font.render(self.custom_modal_title, True, self.BLACK)
-        title_rect = title_surf.get_rect(midtop=(modal_rect.centerx, modal_rect.top + 20))
+        title_surf = self.subtitle_font.render(self.custom_modal_title, True, theme.text_primary)
+        title_rect = title_surf.get_rect(topleft=(modal_rect.left + theme.space_xl, modal_rect.top + theme.space_xl))
         self.screen.blit(title_surf, title_rect)
 
         # Helper text (wrapped if too long)
-        helper_y = self._render_wrapped_text(self.custom_modal_helper, self.subtitle_font, self.GRAY, modal_width - 40, modal_rect.centerx, title_rect.bottom + 10)
+        helper_y = self._render_wrapped_text(self.custom_modal_helper, self.tiny_font, theme.text_secondary, modal_width - 2 * theme.space_xl, modal_rect.centerx, title_rect.bottom + theme.space_md)
 
         # Input field (position based on wrapped text bottom)
-        input_rect = pygame.Rect(modal_rect.left + 50, helper_y + 15, modal_width - 100, 40)
-        pygame.draw.rect(self.screen, self.LIGHT_GRAY, input_rect, border_radius=5)
-        pygame.draw.rect(self.screen, self.BLUE, input_rect, 1, border_radius=5)
+        input_rect = pygame.Rect(modal_rect.left + theme.space_xl, helper_y + theme.space_lg, modal_width - 2 * theme.space_xl - 64, 40)
+        ui_theme.draw_input_field(self.screen, input_rect, focused=True, theme=theme)
         
         # Input text
         display_text = self.custom_modal_text + ("|" if (pygame.time.get_ticks() // 500) % 2 == 0 else "")
-        text_surf = self.font.render(display_text, True, self.BLACK)
-        text_rect = text_surf.get_rect(midleft=(input_rect.left + 10, input_rect.centery))
+        text_surf = self.subtitle_font.render(display_text, True, theme.text_primary)
+        text_rect = text_surf.get_rect(midleft=(input_rect.left + theme.space_md, input_rect.centery))
         self.screen.blit(text_surf, text_rect)
 
         # Unit label
         if self.custom_modal_unit:
-            unit_surf = self.subtitle_font.render(self.custom_modal_unit, True, self.BLACK)
-            unit_rect = unit_surf.get_rect(midleft=(input_rect.right + 5, input_rect.centery))
+            unit_surf = self.tiny_font.render(self.custom_modal_unit, True, theme.text_secondary)
+            unit_rect = unit_surf.get_rect(midleft=(input_rect.right + theme.space_sm, input_rect.centery))
             self.screen.blit(unit_surf, unit_rect)
 
         # Error message (wrapped if too long)
         if self.custom_modal_error:
-            self._render_wrapped_text(self.custom_modal_error, self.subtitle_font, self.RED, modal_width - 40, modal_rect.centerx, input_rect.bottom + 10)
+            self._render_wrapped_text(self.custom_modal_error, self.tiny_font, theme.danger_soft, modal_width - 2 * theme.space_xl, modal_rect.centerx, input_rect.bottom + theme.space_md)
 
         # Buttons
-        button_width = 100
-        button_height = 40
+        button_width, button_height, gap = 100, 40, theme.space_md
+        button_y = modal_rect.bottom - button_height - theme.space_xl
+        can_apply = bool(not self.custom_modal_error and self.custom_modal_text)
         
-        # Apply button
-        apply_btn_rect = pygame.Rect(modal_rect.centerx - 110, modal_rect.bottom - 60, button_width, button_height)
-        apply_color = self.BLUE if not self.custom_modal_error and self.custom_modal_text else self.GRAY
-        pygame.draw.rect(self.screen, apply_color, apply_btn_rect, border_radius=5)
-        apply_text = self.subtitle_font.render("Apply", True, self.WHITE)
-        self.screen.blit(apply_text, apply_text.get_rect(center=apply_btn_rect.center))
+        cancel_btn_rect = pygame.Rect(modal_rect.right - theme.space_xl - 2 * button_width - gap, button_y, button_width, button_height)
+        apply_btn_rect = pygame.Rect(modal_rect.right - theme.space_xl - button_width, button_y, button_width, button_height)
+        ui_theme.draw_button(self.screen, cancel_btn_rect, "Cancel", self.tiny_font, kind="secondary", hover=cancel_btn_rect.collidepoint(mouse), theme=theme)
+        ui_theme.draw_button(self.screen, apply_btn_rect, "Apply", self.tiny_font, kind="primary", hover=apply_btn_rect.collidepoint(mouse), disabled=not can_apply, theme=theme)
         self.apply_btn_rect = apply_btn_rect # Store for click detection
-
-        # Cancel button
-        cancel_btn_rect = pygame.Rect(modal_rect.centerx + 10, modal_rect.bottom - 60, button_width, button_height)
-        pygame.draw.rect(self.screen, self.RED, cancel_btn_rect, border_radius=5)
-        cancel_text = self.subtitle_font.render("Cancel", True, self.WHITE)
-        self.screen.blit(cancel_text, cancel_text.get_rect(center=cancel_btn_rect.center))
         self.cancel_btn_rect = cancel_btn_rect # Store for click detection
 
     def draw_engulfment_confirmation_modal(self):
@@ -20842,36 +21012,32 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         # Store modal rect for click detection (prevents flashing/disappearing UI)
         self.engulfment_modal_rect = modal_rect
         
-        # Draw semi-transparent overlay
-        overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 150))
-        self.screen.blit(overlay, (0, 0))
+        theme = self.theme
+        mouse = self._mouse_pos()
+        ui_theme.draw_modal_frame(self.screen, modal_rect, tone="warning", theme=theme)
         
-        # Draw modal background
-        pygame.draw.rect(self.screen, self.WHITE, modal_rect, border_radius=10)
-        pygame.draw.rect(self.screen, (255, 100, 0), modal_rect, 3, border_radius=10)  # Orange border for warning
-        
-        # Title (warning) - keep larger
-        title_text = "⚠ DESTRUCTIVE CHANGE WARNING"
-        title_surf = self.subtitle_font.render(title_text, True, (255, 100, 0))  # Use subtitle_font (18px) instead of font (28px)
-        title_rect = title_surf.get_rect(midtop=(modal_rect.centerx, modal_rect.top + 20))
+        # Title (warning)
+        title_text = "Destructive change"
+        title_surf = self.subtitle_font.render(title_text, True, theme.text_primary)
+        title_rect = title_surf.get_rect(topleft=(modal_rect.left + theme.space_xl, modal_rect.top + theme.space_xl))
         self.screen.blit(title_surf, title_rect)
+        ui_theme.draw_tag(self.screen, self.micro_font, "warning", (title_rect.right + 8, title_rect.centery - 8), kind="assumed", theme=theme)
         
-        # Star radius info - smaller font
+        # Star radius info
         star = self.bodies_by_id.get(self.engulfment_modal_star_id)
         star_name = star.get("name", "Star") if star else "Star"
         radius_text = f"New star radius: {self._format_value(self.engulfment_modal_new_radius, 'R☉')} ({self.engulfment_modal_star_radius_au:.3f} AU)"
-        radius_surf = self.tiny_font.render(radius_text, True, self.BLACK)  # Use tiny_font (14px)
-        radius_rect = radius_surf.get_rect(midtop=(modal_rect.centerx, title_rect.bottom + 15))
+        radius_surf = self.tiny_font.render(radius_text, True, theme.text_secondary)
+        radius_rect = radius_surf.get_rect(topleft=(modal_rect.left + theme.space_xl, title_rect.bottom + theme.space_md))
         self.screen.blit(radius_surf, radius_rect)
         
-        # Engulfed planets list - smaller font
-        y_pos = radius_rect.bottom + 20
+        # Engulfed planets list
+        y_pos = radius_rect.bottom + theme.space_lg
         warning_text = "The following planets and their moons will be engulfed and destroyed:"
-        warning_surf = self.tiny_font.render(warning_text, True, self.BLACK)  # Use tiny_font (14px)
-        warning_rect = warning_surf.get_rect(midtop=(modal_rect.centerx, y_pos))
+        warning_surf = self.tiny_font.render(warning_text, True, theme.text_secondary)
+        warning_rect = warning_surf.get_rect(topleft=(modal_rect.left + theme.space_xl, y_pos))
         self.screen.blit(warning_surf, warning_rect)
-        y_pos = warning_rect.bottom + 10
+        y_pos = warning_rect.bottom + theme.space_sm
         
         # Build list of engulfed moons (based on engulfed planets)
         engulfed_moons = []
@@ -20901,18 +21067,18 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         # List engulfed planets - smaller font
         for planet_info in self.engulfment_modal_engulfed_planets:
             planet_text = f"  • {planet_info['name']} (orbit: {planet_info['orbit_au']:.3f} AU)"
-            planet_surf = self.tiny_font.render(planet_text, True, self.RED)  # Use tiny_font (14px)
-            planet_rect = planet_surf.get_rect(midleft=(modal_rect.left + 30, y_pos))
+            planet_surf = self.tiny_font.render(planet_text, True, theme.warning_soft)
+            planet_rect = planet_surf.get_rect(topleft=(modal_rect.left + 30, y_pos))
             self.screen.blit(planet_surf, planet_rect)
-            y_pos = planet_rect.bottom + 5
+            y_pos = planet_rect.bottom + 6
         
         # List engulfed moons (if any) - smaller font
         if engulfed_moons:
             y_pos += 8
             for moon_info in engulfed_moons:
                 moon_text = f"    - {moon_info['name']} (moon of {moon_info['parent_name']})"
-                moon_surf = self.tiny_font.render(moon_text, True, self.RED)  # Use tiny_font (14px)
-                moon_rect = moon_surf.get_rect(midleft=(modal_rect.left + 40, y_pos))
+                moon_surf = self.tiny_font.render(moon_text, True, theme.warning_soft)
+                moon_rect = moon_surf.get_rect(topleft=(modal_rect.left + 40, y_pos))
                 self.screen.blit(moon_surf, moon_rect)
                 y_pos = moon_rect.bottom + 4
         
@@ -20947,23 +21113,14 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         self.engulfment_checkbox_rect = checkbox_rect  # Store for click detection
         """
         
-        # Buttons - keep button text readable at subtitle size
-        button_width = 120
-        button_height = 40
-        button_y = modal_rect.bottom - 60
-        
-        # Cancel button (left)
-        cancel_btn_rect = pygame.Rect(modal_rect.centerx - 130, button_y, button_width, button_height)
-        pygame.draw.rect(self.screen, self.RED, cancel_btn_rect, border_radius=5)
-        cancel_text = self.tiny_font.render("Cancel", True, self.WHITE)  # Use tiny_font for consistency
-        self.screen.blit(cancel_text, cancel_text.get_rect(center=cancel_btn_rect.center))
+        # Buttons: cancel (secondary) left, destructive apply right
+        button_width, button_height, gap = 120, 40, theme.space_md
+        button_y = modal_rect.bottom - button_height - theme.space_xl
+        cancel_btn_rect = pygame.Rect(modal_rect.right - theme.space_xl - 2 * button_width - gap, button_y, button_width, button_height)
+        apply_btn_rect = pygame.Rect(modal_rect.right - theme.space_xl - button_width, button_y, button_width, button_height)
+        ui_theme.draw_button(self.screen, cancel_btn_rect, "Cancel", self.tiny_font, kind="secondary", hover=cancel_btn_rect.collidepoint(mouse), theme=theme)
+        ui_theme.draw_button(self.screen, apply_btn_rect, "Apply Change", self.tiny_font, kind="warning", hover=apply_btn_rect.collidepoint(mouse), theme=theme)
         self.engulfment_cancel_btn_rect = cancel_btn_rect
-        
-        # Apply button (right)
-        apply_btn_rect = pygame.Rect(modal_rect.centerx + 10, button_y, button_width, button_height)
-        pygame.draw.rect(self.screen, (255, 100, 0), apply_btn_rect, border_radius=5)  # Orange for destructive action
-        apply_text = self.tiny_font.render("Apply Change", True, self.WHITE)  # Use tiny_font for consistency
-        self.screen.blit(apply_text, apply_text.get_rect(center=apply_btn_rect.center))
         self.engulfment_apply_btn_rect = apply_btn_rect
 
     def draw_placement_engulfment_modal(self):
@@ -20999,15 +21156,12 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         
         # Store modal rect for click detection (prevents flashing/disappearing UI)
         self.placement_engulfment_modal_rect = modal_rect
+        theme = self.theme
+        mouse = self._mouse_pos()
+        ui_theme.draw_modal_frame(self.screen, modal_rect, tone="warning", scrim=False, theme=theme)
         
-        shadow_rect = modal_rect.copy()
-        shadow_rect.move_ip(4, 4)
-        pygame.draw.rect(self.screen, (0, 0, 0, 180), shadow_rect, border_radius=10)
-        pygame.draw.rect(self.screen, (250, 240, 230), modal_rect, border_radius=10)
-        pygame.draw.rect(self.screen, self.RED, modal_rect, 2, border_radius=10)
-        
-        title_surf = self.subtitle_font.render("Warning", True, self.BLACK)
-        title_rect = title_surf.get_rect(midtop=(modal_rect.centerx, modal_rect.top + 12))
+        title_surf = self.subtitle_font.render("Orbit inside host radius", True, theme.text_primary)
+        title_rect = title_surf.get_rect(topleft=(modal_rect.left + theme.space_lg, modal_rect.top + theme.space_lg))
         self.screen.blit(title_surf, title_rect)
         
         line1 = f"{sat_name} orbits within {host_name}'s radius."
@@ -21028,37 +21182,28 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 line2 = f"{sat_name} will appear engulfed by {host_name}."
             line3 = None
         
-        y_pos = title_rect.bottom + 12
+        y_pos = title_rect.bottom + theme.space_md
         y_pos = self._render_wrapped_text(
-            line1, self.tiny_font, self.BLACK, modal_width - 28, modal_rect.centerx, y_pos
+            line1, self.tiny_font, theme.text_secondary, modal_width - 2 * theme.space_lg, modal_rect.centerx, y_pos
         )
-        y_pos += 6
+        y_pos += 4
         y_pos = self._render_wrapped_text(
-            line2, self.tiny_font, self.BLACK, modal_width - 28, modal_rect.centerx, y_pos
+            line2, self.tiny_font, theme.warning_soft, modal_width - 2 * theme.space_lg, modal_rect.centerx, y_pos
         )
         if line3:
-            y_pos += 8
+            y_pos += 6
             y_pos = self._render_wrapped_text(
-                line3, self.tiny_font, self.GRAY, modal_width - 28, modal_rect.centerx, y_pos
+                line3, self.tiny_font, theme.text_tertiary, modal_width - 2 * theme.space_lg, modal_rect.centerx, y_pos
             )
         
-        # Buttons - smaller font for consistency
-        button_width = 160
-        button_height = 40
-        button_y = modal_rect.bottom - 60
-        
-        # Cancel placement
-        cancel_btn_rect = pygame.Rect(modal_rect.centerx - 190, button_y, button_width, button_height)
-        pygame.draw.rect(self.screen, self.RED, cancel_btn_rect, border_radius=5)
-        cancel_text = self.tiny_font.render("Cancel Placement", True, self.WHITE)  # Use tiny_font (14px)
-        self.screen.blit(cancel_text, cancel_text.get_rect(center=cancel_btn_rect.center))
+        # Buttons: cancel left, primary fix right
+        button_width, button_height, gap = 160, 38, theme.space_md
+        button_y = modal_rect.bottom - button_height - theme.space_lg
+        cancel_btn_rect = pygame.Rect(modal_rect.right - theme.space_lg - 2 * button_width - gap, button_y, button_width, button_height)
+        choose_btn_rect = pygame.Rect(modal_rect.right - theme.space_lg - button_width, button_y, button_width, button_height)
+        ui_theme.draw_button(self.screen, cancel_btn_rect, "Cancel Placement", self.tiny_font, kind="secondary", hover=cancel_btn_rect.collidepoint(mouse), theme=theme)
+        ui_theme.draw_button(self.screen, choose_btn_rect, "Choose New AU", self.tiny_font, kind="primary", hover=choose_btn_rect.collidepoint(mouse), theme=theme)
         self.placement_engulfment_cancel_btn_rect = cancel_btn_rect
-        
-        # Choose new AU
-        choose_btn_rect = pygame.Rect(modal_rect.centerx + 30, button_y, button_width, button_height)
-        pygame.draw.rect(self.screen, (0, 140, 255), choose_btn_rect, border_radius=5)
-        choose_text = self.tiny_font.render("Choose New AU", True, self.WHITE)  # Use tiny_font (14px)
-        self.screen.blit(choose_text, choose_text.get_rect(center=choose_btn_rect.center))
         self.placement_engulfment_choose_au_btn_rect = choose_btn_rect
 
     def draw_planet_moon_engulfment_modal(self):
@@ -21080,15 +21225,12 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             modal_height,
         )
         self.planet_moon_engulfment_modal_rect = modal_rect
+        theme = self.theme
+        mouse = self._mouse_pos()
+        ui_theme.draw_modal_frame(self.screen, modal_rect, tone="warning", scrim=False, theme=theme)
         
-        shadow_rect = modal_rect.copy()
-        shadow_rect.move_ip(4, 4)
-        pygame.draw.rect(self.screen, (0, 0, 0, 180), shadow_rect, border_radius=10)
-        pygame.draw.rect(self.screen, (250, 240, 230), modal_rect, border_radius=10)
-        pygame.draw.rect(self.screen, self.RED, modal_rect, 2, border_radius=10)
-        
-        title_surf = self.subtitle_font.render("Warning", True, self.BLACK)
-        title_rect = title_surf.get_rect(midtop=(modal_rect.centerx, modal_rect.top + 12))
+        title_surf = self.subtitle_font.render("Moons inside new radius", True, theme.text_primary)
+        title_rect = title_surf.get_rect(topleft=(modal_rect.left + theme.space_lg, modal_rect.top + theme.space_lg))
         self.screen.blit(title_surf, title_rect)
         
         pname = planet.get("name", "Planet")
@@ -21100,32 +21242,26 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             f"will destroy {n_moons} {moon_word}:"
         )
         y = self._render_wrapped_text(
-            line_main, self.tiny_font, self.BLACK, modal_width - 28, modal_rect.centerx, title_rect.bottom + 10
+            line_main, self.tiny_font, theme.text_secondary, modal_width - 2 * theme.space_lg, modal_rect.centerx, title_rect.bottom + theme.space_md
         )
         y += 6
         for m in self.planet_moon_engulfment_engulfed_moons[:8]:
             line = f"  • {m.get('name', 'Moon')} (orbit {float(m.get('orbit_au', 0)):g} AU)"
             y = self._render_wrapped_text(
-                line, self.tiny_font, self.BLACK, modal_width - 28, modal_rect.centerx, y
+                line, self.tiny_font, theme.warning_soft, modal_width - 2 * theme.space_lg, modal_rect.centerx, y
             )
         if len(self.planet_moon_engulfment_engulfed_moons) > 8:
             y = self._render_wrapped_text(
-                "  • …", self.tiny_font, self.GRAY, modal_width - 28, modal_rect.centerx, y
+                "  • …", self.tiny_font, theme.text_tertiary, modal_width - 2 * theme.space_lg, modal_rect.centerx, y
             )
         
-        button_width = 100
-        button_height = 40
-        button_y = modal_rect.bottom - 56
-        cancel_btn_rect = pygame.Rect(modal_rect.centerx - 115, button_y, button_width, button_height)
-        pygame.draw.rect(self.screen, self.RED, cancel_btn_rect, border_radius=5)
-        cancel_text = self.tiny_font.render("Cancel", True, self.WHITE)
-        self.screen.blit(cancel_text, cancel_text.get_rect(center=cancel_btn_rect.center))
+        button_width, button_height, gap = 100, 38, theme.space_md
+        button_y = modal_rect.bottom - button_height - theme.space_lg
+        cancel_btn_rect = pygame.Rect(modal_rect.right - theme.space_lg - 2 * button_width - gap, button_y, button_width, button_height)
+        apply_btn_rect = pygame.Rect(modal_rect.right - theme.space_lg - button_width, button_y, button_width, button_height)
+        ui_theme.draw_button(self.screen, cancel_btn_rect, "Cancel", self.tiny_font, kind="secondary", hover=cancel_btn_rect.collidepoint(mouse), theme=theme)
+        ui_theme.draw_button(self.screen, apply_btn_rect, "Apply", self.tiny_font, kind="warning", hover=apply_btn_rect.collidepoint(mouse), theme=theme)
         self.planet_moon_engulfment_cancel_btn_rect = cancel_btn_rect
-        
-        apply_btn_rect = pygame.Rect(modal_rect.centerx + 15, button_y, button_width, button_height)
-        pygame.draw.rect(self.screen, (0, 120, 200), apply_btn_rect, border_radius=5)
-        ok_text = self.tiny_font.render("OK", True, self.WHITE)
-        self.screen.blit(ok_text, ok_text.get_rect(center=apply_btn_rect.center))
         self.planet_moon_engulfment_apply_btn_rect = apply_btn_rect
 
     def apply_star_radius_change_with_consequences(self, star_id: str, new_radius_rsun: float, delete_planets: bool = False):
@@ -21350,8 +21486,8 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         if anchor_pos:
             pos = anchor_pos
         else:
-            pos = pygame.mouse.get_pos()
-        padding = 6
+            pos = self._mouse_pos()
+        padding = self.theme.space_md
         
         # Handle multi-line text
         if isinstance(text, list):
@@ -21365,13 +21501,13 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
         total_height = 0
         for line in lines:
             if line:
-                line_surface = self.subtitle_font.render(str(line), True, self.WHITE)
+                line_surface = self.tiny_font.render(str(line), True, self.theme.text_primary)
                 rendered_lines.append(line_surface)
                 max_width = max(max_width, line_surface.get_width())
                 total_height += line_surface.get_height() + 2  # 2px spacing between lines
             else:
                 rendered_lines.append(None)
-                total_height += self.subtitle_font.get_height() + 2
+                total_height += self.tiny_font.get_height() + 2
         
         if not rendered_lines:
             return
@@ -21391,7 +21527,8 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
             bg_rect.top = 5
             
         tooltip_bg = pygame.Surface(bg_rect.size, pygame.SRCALPHA)
-        tooltip_bg.fill((0, 0, 0, 180))
+        pygame.draw.rect(tooltip_bg, self.theme.tooltip_bg, tooltip_bg.get_rect(), border_radius=self.theme.radius_sm)
+        pygame.draw.rect(tooltip_bg, self.theme.tooltip_border, tooltip_bg.get_rect(), 1, border_radius=self.theme.radius_sm)
         surface.blit(tooltip_bg, bg_rect.topleft)
         
         # Blit each line
@@ -21401,7 +21538,7 @@ Total stellar power output relative to the Sun. In AIET this value drives stella
                 surface.blit(line_surface, (bg_rect.left + padding, bg_rect.top + y_offset))
                 y_offset += line_surface.get_height() + 2
             else:
-                y_offset += self.subtitle_font.get_height() + 2
+                y_offset += self.tiny_font.get_height() + 2
 
     def _update_planet_scores(self):
         """

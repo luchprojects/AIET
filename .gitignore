@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Logs and local output
+logs/
+*.log
+exports/
+
+# Editor / agent
+.cursor/
+
+# OS / editor
+.DS_Store
+Thumbs.db

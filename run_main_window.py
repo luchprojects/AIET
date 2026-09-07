@@ -11,10 +11,7 @@ from __future__ import annotations
 def main() -> int:
     # Import from the package-style tree (`src/...`).
     # This file must be run from the repository root so `src` is importable.
-    try:
-        from src.physics.simulation_engine import SimulationEngine
-    except ImportError:
-        from src.simulation_engine import SimulationEngine
+    from src.simulation_engine import SimulationEngine
     from src.ui.main_window import SolarSystemVisualizer
 
     engine = SimulationEngine()
